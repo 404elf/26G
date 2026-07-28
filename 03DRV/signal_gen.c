@@ -26,8 +26,6 @@ static volatile float current_vpp_target = 0.0f;
 static volatile uint32_t amp_scale_q12 = 0;   // 幅度缩放系数 (Q12定点数)
 static volatile int32_t  offset_dac_val = 0;  // DAC 偏置值 (整型)
 
-// 输出模式: 0=正弦DDS, 1=方波码流
-static volatile uint8_t siggen_mode = 0;
 
 /* ============================================================================
  *                             内部辅助优化函数
@@ -175,14 +173,12 @@ void Set_DDS_Freq(float freq) {
 
 // 当前半个缓冲被 DAC 发送出去时，触发回调
 void SignalGen_DAC_HalfCpltCallback(void) {
-    if (siggen_mode == 1) return;  // 方波码流模式下不覆盖缓冲区
     // DMA 正在发后半段，CPU 极速算出接下来的 DDS 点填入前半段
     DDS_Generate_Block(&DAC_Buffer[0], DAC_BUF_SIZE / 2);
 }
 
 // 当后半个缓冲也被 DAC 发送出去时，触发回调
 void SignalGen_DAC_FullCpltCallback(void) {
-    if (siggen_mode == 1) return;  // 方波码流模式下不覆盖缓冲区
     // DMA 扭头去发前半段，CPU 极速算出接下来的 DDS 点填入后半段
     DDS_Generate_Block(&DAC_Buffer[DAC_BUF_SIZE / 2], DAC_BUF_SIZE / 2);
 }
