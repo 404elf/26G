@@ -48,3 +48,11 @@ Desktop.ini
 *.swp
 *.swo
 *~
+
+.continue/
+.claude/
+.gitnexus/
+.agents/
+*.bak
+AGENTS.md
+CLAUDE.md
