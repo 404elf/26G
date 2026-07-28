@@ -30,10 +30,8 @@ void app_init(void) {
     VGA_SetVoltage(1.0f);
 
     //开启时钟（顺手清零）
-    __HAL_TIM_SET_COUNTER(&htim3,0);
-    __HAL_TIM_SET_COUNTER(&htim6,0);
-    HAL_TIM_Base_Start(&htim3);
-    HAL_TIM_Base_Start(&htim6);
+    __HAL_TIM_SET_COUNTER(&htim2,0);
+    HAL_TIM_Base_Start(&htim2);
 
 }
 

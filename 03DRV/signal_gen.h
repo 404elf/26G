@@ -8,8 +8,8 @@
 #endif
 #define DAC_SAMPLE_RATE  800000.0f   // DAC采样率（由触发定时器频率决定）
 
-#define SIGGEN_TIM        TIM6               // 触发定时器
-#define SIGGEN_TIM_HANDLE htim6               // 定时器句柄
+#define SIGGEN_TIM        TIM2               // 触发定时器
+#define SIGGEN_TIM_HANDLE htim2               // 定时器句柄
 #define SIGGEN_DAC_CH     DAC_CHANNEL_2       // DAC通道
 
 ////define SINE_SAMPLES 200     
