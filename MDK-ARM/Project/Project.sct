@@ -16,10 +16,14 @@ LR_IROM1 0x08000000 0x00100000  {    ; load region size_region
   }
   ; 2. IRAM1：主内存 (112KB)
   RW_IRAM1 0x20000000 0x0001C000  {  ; RW data
+   ; app 层和普通运行数据优先放这里。
+   *(.iram1)
    .ANY (+RW +ZI)
   }
   ; 3. IRAM2：DMA 优化区 (16KB)
   RW_IRAM2 0x2001C000 0x00004000  {
+    ; ADC DMA 缓冲区放这里，减少和其他运行数据的竞争。
+    *(.iram2)
     *(.sram2_data)                    ; 被标志为.sram2_data的段放这(手动)
    .ANY (+RW +ZI)
   }

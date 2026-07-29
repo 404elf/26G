@@ -3,23 +3,33 @@
 
 #include "main.h"
 
-/* ===== 移植配置：修改这两个宏即可适配不同 ADC 外设 ===== */
-#define MEASURE_ADC_HANDLE   hadc1      // ADC 句柄（CubeMX 生成的变量名）
-#define MEASURE_ADC_INSTANCE ADC1       // ADC 外设实例（用于回调中判断）
+#include "FFT.h"
 
-#include "FFT.h"   // FFT_LENGTH 定义在 FFT.h 中
-#define ADC_BUF_SIZE (FFT_LENGTH * 2)
+// DMA 采样帧长度，和 FFT 输入长度保持一致，方便后续直接处理。
+#define ADC_DMA_WORDS  2048U
+// 当前工程里 DMA word 数和缓冲区大小保持一致，避免多一层映射。
+#define ADC_BUF_SIZE   ADC_DMA_WORDS
 
-extern volatile uint8_t adc_buffer_ready;   // 0=无, 1=半缓冲就绪, 2=全缓冲就绪
-extern uint16_t ADC_Value_Buffer[ADC_BUF_SIZE];
-extern float v_process_buffer[2][FFT_LENGTH];
+// 采样完成标志：0 表示未就绪，1/2 表示半帧/整帧数据可用。
+extern volatile uint8_t adc_buffer_ready;
+// ADC triple mode 的 DMA 原始缓冲区，放到 IRAM2 提升访问效率。
+extern uint32_t adc_dma_buf[ADC_DMA_WORDS];
 
-void ADC_Measure_Start(void);   // 启动ADC测量
-void ADC_Cal_Vpp(uint16_t* pBuffer, uint16_t length, uint8_t ping_pong_index);    // 计算Vpp峰峰值
+// 初始化采样缓冲和状态。
+void ADC_Measure_Init(void);
+// 启动一次采样链路。
+void ADC_Measure_Start(void);
+// 停止采样链路并清理状态。
+void ADC_Measure_Stop(void);
 
+// 早期保留的 Vpp 计算接口，当前主要用于兼容旧代码。
+void ADC_Cal_Vpp(uint16_t *pBuffer, uint16_t length, uint8_t ping_pong_index);
+// 当前帧 Vpp 的统一计算入口。
 float Get_Vpp(void);
 
+// DMA 半传输完成回调。
 void Measure_ADC_HalfCpltCallback(void);
+// DMA 全传输完成回调。
 void Measure_ADC_FullCpltCallback(void);
 
 #endif

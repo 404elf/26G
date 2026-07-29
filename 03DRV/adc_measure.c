@@ -1,77 +1,94 @@
 #include "adc_measure.h"
+
+#include <string.h>
+
 #include "adc.h"
+#include "tim.h"
+#include "VCA821.h"
 
-/**
- * 文件介绍：这里主要运用了双缓冲机制，以半中断和全中断为界，来回的对Vpp进行计算
- */
+// 原始 DMA 缓冲区放在 IRAM2，便于和主内存分离。
+uint32_t adc_dma_buf[ADC_DMA_WORDS] __attribute__((section(".iram2")));
 
+// 采样完成标志：由 ADC 回调更新，任务层轮询读取。
+volatile uint8_t adc_buffer_ready = 0;
+static uint8_t g_adc_measure_started = 0;
 
-uint16_t ADC_Value_Buffer[ADC_BUF_SIZE] __attribute__((section(".sram2_data")));    // ADC采样值缓冲区
-float v_process_buffer[2][FFT_LENGTH];
-
-volatile uint8_t adc_buffer_ready = 0;  // 0=无, 1=半缓冲就绪, 2=全缓冲就绪
-
-//*markdown：可见这种计算不返回，用全局变量引出是一种很方便的方法
-//全局变量Vpp（需要自取）
-volatile float current_measured_vpp = 0.0f; 
-
-/**
- * @brief 启动ADC
- */
-void ADC_Measure_Start(void){
-    HAL_ADC_Start_DMA(&MEASURE_ADC_HANDLE, (uint32_t*)ADC_Value_Buffer, ADC_BUF_SIZE);
+// 统一清理采样状态，避免旧帧标志残留。
+static void ADC_Measure_ClearState(void)
+{
+    adc_buffer_ready = 0;
 }
 
-//*mark:这里的Get，实现了处理与读写分离的操作，确保了数值自动更新，随意拿取
-/**
- * @brief 从测量数据中找到Vpp,并准备好待解调数组
- * @param pBuffer 指向测量数据
- * @param length 需要处理的数据大小
- */
-void ADC_Cal_Vpp(uint16_t* pBuffer, uint16_t length, uint8_t ping_pong_index){
-    // 静态变量，重复运行，到点清零，需要记忆
+void ADC_Measure_Init(void)
+{
+    // 启动前先清空 DMA 缓冲和状态位。
+    memset(adc_dma_buf, 0, sizeof(adc_dma_buf));
+    ADC_Measure_ClearState();
+    g_adc_measure_started = 0;
+}
+
+void ADC_Measure_Start(void)
+{
+    // 已经启动时不重复开链路。
+    if (g_adc_measure_started) {
+        return;
+    }
+
+    ADC_Measure_ClearState();
+    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS) == HAL_OK) {
+        (void)HAL_TIM_Base_Start(&htim8);
+        g_adc_measure_started = 1;
+    }
+}
+
+void ADC_Measure_Stop(void)
+{
+    // 停止时同时关闭 TIM8 和 ADC DMA。
+    if (!g_adc_measure_started) {
+        return;
+    }
+
+    (void)HAL_TIM_Base_Stop(&htim8);
+    (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
+    g_adc_measure_started = 0;
+    ADC_Measure_ClearState();
+}
+
+void ADC_Cal_Vpp(uint16_t *pBuffer, uint16_t length, uint8_t ping_pong_index)
+{
+    // 旧接口保留，当前主要用于兼容老调用点。
     static uint16_t global_max = 0;
     static uint16_t global_min = 4095;
-    
-    //半中断中找极值
-    for (int i = 0; i < length; i++){
-        //*mark：能用本地变量，就别用外设寄存器，也别用内存
-        uint16_t pBuffer_Reg=pBuffer[i];
-        if(pBuffer_Reg > global_max) global_max = pBuffer_Reg;
-        if(pBuffer_Reg < global_min) global_min = pBuffer_Reg;
 
-        v_process_buffer[ping_pong_index][i] = (float)pBuffer_Reg-2048.0f;
+    for (uint16_t i = 0; i < length; i++) {
+        uint16_t sample = pBuffer[i];
+        if (sample > global_max) {
+            global_max = sample;
+        }
+        if (sample < global_min) {
+            global_min = sample;
+        }
+        (void)ping_pong_index;
     }
-    
-        // 计算最终的 Vpp
-        current_measured_vpp = global_max - global_min;
-        
-        //准备重新测量
-        global_max = 0;
-        global_min = 4095;
-    
+
+    global_max = 0;
+    global_min = 4095;
 }
 
-/**
- * @brief 导出Vpp
- */
-float Get_Vpp(void) {
-    return (float)(current_measured_vpp) * 3.3f / 4095.0f;
+float Get_Vpp(void)
+{
+    // 使用统一的 DMA 缓冲和增益信息来计算峰峰值。
+    return SIG_Calculate_Vpp(adc_dma_buf, VCA821_GetLinearGain());
 }
 
-
-/**
- * @brief 乒乓缓存前半段完成中断(半满)：DMA仍在继续往后半段装入数据，此刻CPU趁机处理刚装好的前半段(0 ~ 99)
- */
-void Measure_ADC_HalfCpltCallback(void) {
-     ADC_Cal_Vpp(&ADC_Value_Buffer[0], ADC_BUF_SIZE / 2,0);
-     adc_buffer_ready = 1;
+void Measure_ADC_HalfCpltCallback(void)
+{
+    // 半传输完成时先标记为 1，告诉任务层数据开始可读。
+    adc_buffer_ready = 1;
 }
 
-/**
- * @brief 乒乓缓存全满完成中断：DMA发生回放绕并开始重写前半段数据，此刻CPU趁机处理刚装好的后半段(100 ~ 199)
- */
-void Measure_ADC_FullCpltCallback(void) {
-    ADC_Cal_Vpp(&ADC_Value_Buffer[ADC_BUF_SIZE / 2], ADC_BUF_SIZE / 2,1);
+void Measure_ADC_FullCpltCallback(void)
+{
+    // 全传输完成时标记为 2，表示整帧数据已经准备好。
     adc_buffer_ready = 2;
 }
