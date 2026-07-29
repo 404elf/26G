@@ -8,7 +8,7 @@
 #include "sig_util.h"
 
 // 原始 DMA 缓冲区放在 IRAM2，便于和主内存分离。
-uint32_t adc_dma_buf[ADC_DMA_WORDS] __attribute__((section(".iram2")));
+uint32_t adc_dma_buf[ADC_DMA_TOTAL] __attribute__((section(".iram2")));
 
 // 采样完成标志：由 ADC 回调更新，任务层轮询读取。
 volatile uint8_t adc_buffer_ready = 0;
@@ -36,7 +36,7 @@ void ADC_Measure_Start(void)
     }
 
     ADC_Measure_ClearState();
-    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS) == HAL_OK) {
+    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_TOTAL) == HAL_OK) {
         (void)HAL_TIM_Base_Start(&htim8);
         g_adc_measure_started = 1;
     }

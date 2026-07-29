@@ -82,9 +82,8 @@ float SIG_Calculate_TrueRMS(const float *harmonic_amps, uint8_t count)
 
 	float32_t sum = 0.0f;
 	for (uint8_t i = 0; i < count; i++) {
-		// 每个谐波按正弦波换算成 RMS 后再平方叠加。
-		float32_t component = harmonic_amps[i] / 1.41421356f;
-		sum += component * component;
+		// (Vp / √2)? = Vp? / 2，用乘法代替除法更快。
+		sum += harmonic_amps[i] * harmonic_amps[i] * 0.5f;
 	}
 	return sqrtf(sum);
 }
@@ -145,9 +144,9 @@ void SIG_CubicSpline_Resample(const float *in_pts, uint16_t in_len, uint16_t *ou
 		return;
 	}
 
+	// 1. 寻找当前波形段的极值
 	float32_t min_value = in_pts[0];
 	float32_t max_value = in_pts[0];
-	// 先找出当前段波形的最大最小值，再映射到屏幕像素高度。
 	for (uint16_t i = 1; i < in_len; i++) {
 		if (in_pts[i] < min_value) {
 			min_value = in_pts[i];
@@ -165,8 +164,8 @@ void SIG_CubicSpline_Resample(const float *in_pts, uint16_t in_len, uint16_t *ou
 		return;
 	}
 
+	// 2. Catmull-Rom 四点样条插值：高频波峰圆滑无折角
 	for (uint16_t out_index = 0; out_index < out_len; out_index++) {
-		// 屏幕上的每个像素点都来自原始波形的一段插值结果。
 		float32_t source_pos;
 		if (out_len == 1U) {
 			source_pos = 0.0f;
@@ -174,17 +173,29 @@ void SIG_CubicSpline_Resample(const float *in_pts, uint16_t in_len, uint16_t *ou
 			source_pos = ((float32_t)out_index * (float32_t)(in_len - 1U)) / (float32_t)(out_len - 1U);
 		}
 
-		uint16_t left_index = (uint16_t)source_pos;
-		uint16_t right_index = (left_index + 1U < in_len) ? (left_index + 1U) : left_index;
-		float32_t fraction = source_pos - (float32_t)left_index;
-		float32_t interpolated = in_pts[left_index] + (in_pts[right_index] - in_pts[left_index]) * fraction;
+		int i1 = (int)source_pos;
+		int i0 = (i1 > 0) ? (i1 - 1) : 0;
+		int i2 = (i1 + 1 < (int)in_len) ? (i1 + 1) : (in_len - 1);
+		int i3 = (i1 + 2 < (int)in_len) ? (i1 + 2) : (in_len - 1);
+
+		float32_t t = source_pos - (float32_t)i1;
+		float32_t t2 = t * t;
+		float32_t t3 = t2 * t;
+
+		float32_t p0 = in_pts[i0];
+		float32_t p1 = in_pts[i1];
+		float32_t p2 = in_pts[i2];
+		float32_t p3 = in_pts[i3];
+
+		float32_t interpolated = 0.5f * ((2.0f * p1) +
+		                                 (-p0 + p2) * t +
+		                                 (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+		                                 (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+
+		// 3. 归一化并映射到 20~220 像素区间（留上下边距，避免贴屏边）
 		float32_t normalized = (interpolated - min_value) / range;
-		float32_t pixel = (1.0f - SIG_ClampFloat(normalized, 0.0f, 1.0f)) * 240.0f;
-		if (pixel < 0.0f) {
-			pixel = 0.0f;
-		} else if (pixel > 240.0f) {
-			pixel = 240.0f;
-		}
+		normalized = SIG_ClampFloat(normalized, 0.0f, 1.0f);
+		float32_t pixel = 220.0f - normalized * 200.0f;
 		out_pixels[out_index] = (uint16_t)(pixel + 0.5f);
 	}
 }

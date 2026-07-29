@@ -68,26 +68,33 @@ void Task_Signal_Processing(void)
 	// 触发 ADC + DMA 开始收这一帧数据。
 	ADC_Measure_Start();
 
-	// ===== 第二段：等待采样完成 =====
-	// 等待 DMA 全帧完成中断把 adc_buffer_ready 置成 2。
+	// ===== 第二段：等待采样完成（乒乓双缓冲） =====
+	// 等待 DMA 半帧/全帧完成中断把 adc_buffer_ready 置成 1 或 2。
+	// 1 → 前半帧 (adc_dma_buf[0..ADC_DMA_WORDS-1]) 就绪
+	// 2 → 后半帧 (adc_dma_buf[ADC_DMA_WORDS..]) 就绪
+	// 此时 DMA 正在写另一半，不会碰已完成的一半 → 读写安全。
 	// 如果硬件异常、触发链断了、或者采样没正常结束，就在超时后退出，避免主循环死等。
 	uint32_t wait_start = HAL_GetTick();
-	while ((adc_buffer_ready != 2U) && ((HAL_GetTick() - wait_start) < TASK_SAMPLE_TIMEOUT_MS)) {
+	while ((adc_buffer_ready == 0U) && ((HAL_GetTick() - wait_start) < TASK_SAMPLE_TIMEOUT_MS)) {
 	}
-	if (adc_buffer_ready != 2U) {
+	if (adc_buffer_ready == 0U) {
 		// 超时说明这一帧数据不可信，直接停止并重新初始化采样状态。
 		ADC_Measure_Stop();
 		ADC_Measure_Init();
 		Task_ResetScreenData();
 		return;
 	}
-	// 数据已经完整到位，清掉就绪标志，准备下一轮。
+
+	// 根据就绪标志选择安全的半区指针。
+	// DMA 此时在写另一半，这一半不会被碰。
+	uint32_t *pActiveBuf = (adc_buffer_ready == 1U) ?
+	    &adc_dma_buf[0] : &adc_dma_buf[ADC_DMA_WORDS];
 	adc_buffer_ready = 0U;
 
 	// ===== 第三段：做频域分析 =====
 	// 把 DMA 原始数据拆开、加窗、做 FFT。
 	// 这一步之后，rfft_mag 里就是整帧信号的频谱了。
-	FFT_Process_Unpack(adc_dma_buf, gain_snapshot);
+	FFT_Process_Unpack(pActiveBuf, gain_snapshot);
 
 	// 先在基波可能出现的范围里找最大峰。
 	// 这里得到的是“最像基波”的频点，不是最终精确值。
@@ -114,15 +121,24 @@ void Task_Signal_Processing(void)
 	g_screen_data.harmonic_freq[0] = f1 / 1000.0f;
 	g_screen_data.harmonic_amp[0] = A1 * 1000.0f;
 
-	// ===== 第五段：搜索谐波 =====
-	// 下面按 2f1、3f1、4f1 逐个找谐波。
+	// ===== 第五段：搜索谐波（动态遍历，无硬编码限制） =====
+	// 按 2f1, 3f1, 4f1, 5f1, ... 逐个找谐波。
+	// 终止条件两个：
+	//   1. f_target > 500kHz — 超出题目规定范围
+	//   2. 已找满 2 个谐波（题目明确最多 2 个谐波分量）
 	// 先局部寻峰，再做噪声门限判断，最后才做精细插值。
 	uint8_t h_count = 1U;
-	for (uint8_t harmonic = 2U; harmonic <= 4U; harmonic++) {
+	for (uint8_t harmonic = 2U; ; harmonic++) {
+		// 终止条件一：已找满 2 个谐波（基波+谐波≥3），直接退出。
+		if (h_count >= 3U) {
+			break;
+		}
+
 		// 理论谐波频率。
 		float32_t f_target = f1 * (float32_t)harmonic;
+
+		// 终止条件二：超出题目规定的 500kHz 上限，不再继续搜索。
 		if (f_target > 500000.0f) {
-			// 超出有效范围就不用继续找了。
 			break;
 		}
 
@@ -147,7 +163,7 @@ void Task_Signal_Processing(void)
 		// 同样做一次补偿，保持各次谐波口径一致。
 		Ah = SIG_Apply_LUT_Compensation(fh, Ah);
 
-		if (Ah * 1000.0f > 3.0f && h_count < 4U) {
+		if (Ah * 1000.0f > 3.0f) {
 			// 只有幅值足够明显的谐波才写入屏幕数据。
 			g_screen_data.harmonic_freq[h_count] = fh / 1000.0f;
 			g_screen_data.harmonic_amp[h_count] = Ah * 1000.0f;
@@ -160,7 +176,7 @@ void Task_Signal_Processing(void)
 	// Vpp 则直接从原始 DMA 数据里统计最大最小值得到。
 	g_screen_data.harmonic_count = h_count;
 	g_screen_data.Vrms_val = SIG_Calculate_TrueRMS(g_screen_data.harmonic_amp, h_count);
-	g_screen_data.Vpp_val = SIG_Calculate_Vpp(adc_dma_buf, gain_snapshot) * 1000.0f;
+	g_screen_data.Vpp_val = SIG_Calculate_Vpp(pActiveBuf, gain_snapshot) * 1000.0f;
 
 	// ===== 第七段：生成波形显示数据 =====
 	// 根据基波周期决定屏幕上要画多少个点。
@@ -179,7 +195,8 @@ void Task_Signal_Processing(void)
 	}
 
 	// 从一个比较稳定的零交点开始截取波形，方便屏幕上显示对齐。
-	int n_start = SIG_Find_Hysteresis_ZeroCrossing(rfft_input, 1.65f);
+	// 时域信号已去直流偏置，零均值 → 用 0.0V 作为过零阈值。
+	int n_start = SIG_Find_Hysteresis_ZeroCrossing(rfft_time_domain, 0.0f);
 	if (n_start < 0) {
 		// 找不到合适零交点时，就从头开始。
 		n_start = 0;
@@ -191,7 +208,7 @@ void Task_Signal_Processing(void)
 
 	// 把原始波形重采样成 120 个屏幕点。
 	// 这样屏幕上看到的波形更平滑，也更适合显示。
-	SIG_CubicSpline_Resample(&rfft_input[n_start], wave_points, g_screen_data.wave_pixels, 120U);
+	SIG_CubicSpline_Resample(&rfft_time_domain[n_start], wave_points, g_screen_data.wave_pixels, 120U);
 	// 柱状图则由谐波幅值直接生成。
 	Task_UpdateSpectrumBars(h_count);
 

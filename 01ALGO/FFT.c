@@ -7,10 +7,12 @@
 
 // FFT 运行实例，初始化后供后续每帧复用。
 arm_rfft_fast_instance_f32 g_rfft_instance;
-// 时域输入放在 CCMRAM 中，减少和 DMA 区域的访问冲突。
+// 加窗后的时域输入放在 CCMRAM 中，供 FFT 使用。
 float32_t rfft_input[FFT_LENGTH] __attribute__((section(".ccmram")));
-// 复数域临时输出缓冲。
-float32_t rfft_output_complex[FFT_LENGTH] __attribute__((section(".ccmram")));
+// 去直流、未加窗的纯交流时域信号（供过零触发和波形显示使用）。
+float32_t rfft_time_domain[FFT_LENGTH] __attribute__((section(".ccmram")));
+// 复数域临时输出缓冲（IRAM1，FFT 时 CPU 独占，无需 CCMRAM）。
+float32_t rfft_output_complex[FFT_LENGTH];
 // 幅值谱，后续基波/谐波搜索都直接读这个数组。
 float32_t rfft_mag[FFT_BIN_COUNT] __attribute__((section(".ccmram")));
 
@@ -72,23 +74,38 @@ void FFT_Process_Unpack(const uint32_t *dma_buf, float linear_gain)
     return;
   }
 
-  // 将双路打包采样拆成时域样本，并叠加 Hann 窗，减少频谱泄漏。
-  (void)linear_gain;
-
+  // ===== 第一遍：解包并累加，求本帧真实直流偏置 =====
+  float32_t v_sum = 0.0f;
   for (uint32_t word_index = 0; word_index < ADC_DMA_WORDS; word_index++) {
     uint32_t packed = dma_buf[word_index];
     uint16_t sample_early = (uint16_t)(packed & 0xFFFFU) & 0x0FFFU;
     uint16_t sample_late = (uint16_t)((packed >> 16U) & 0xFFFFU) & 0x0FFFU;
 
     uint32_t sample_index = word_index * 2U;
-    float32_t voltage_early = (float32_t)sample_early * 3.3f / 4096.0f;
-    float32_t voltage_late = (float32_t)sample_late * 3.3f / 4096.0f;
+    float32_t v_early = (float32_t)sample_early * 3.3f / 4096.0f;
+    float32_t v_late  = (float32_t)sample_late  * 3.3f / 4096.0f;
 
-    float32_t window_early = 0.5f * (1.0f - arm_cos_f32((2.0f * 3.14159265358979323846f * (float32_t)sample_index) / (float32_t)FFT_LENGTH));
-    float32_t window_late = 0.5f * (1.0f - arm_cos_f32((2.0f * 3.14159265358979323846f * (float32_t)(sample_index + 1U)) / (float32_t)FFT_LENGTH));
+    // 暂存原始电压值，用于第二遍去直流。
+    rfft_input[sample_index]     = v_early;
+    rfft_input[sample_index + 1U] = v_late;
+    v_sum += v_early + v_late;
+  }
 
-    rfft_input[sample_index] = voltage_early * window_early;
-    rfft_input[sample_index + 1U] = voltage_late * window_late;
+  // 本帧真实平均直流偏置（适应硬件容差和温漂）。
+  float32_t V_avg = v_sum / (float32_t)FFT_LENGTH;
+  (void)linear_gain;
+
+  // ===== 第二遍：去直流归零 → 存 time_domain；加 Hann 窗 → 存 rfft_input =====
+  for (uint32_t i = 0; i < FFT_LENGTH; i++) {
+    // 减去直流偏置，得到零均值纯交流信号。
+    float32_t ac_v = rfft_input[i] - V_avg;
+
+    // 未加窗版本：留给过零触发和波形显示。
+    rfft_time_domain[i] = ac_v;
+
+    // 加 Hann 窗版本：留给 FFT 频域分析。
+    float32_t window = 0.5f * (1.0f - arm_cos_f32((2.0f * 3.14159265358979323846f * (float32_t)i) / (float32_t)FFT_LENGTH));
+    rfft_input[i] = ac_v * window;
   }
 
   arm_rfft_fast_f32(&g_rfft_instance, rfft_input, rfft_output_complex, 0);

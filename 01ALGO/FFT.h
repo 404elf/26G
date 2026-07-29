@@ -14,8 +14,10 @@
 
 // FFT 实例和缓冲区都放在全局，方便任务层直接调用。
 extern arm_rfft_fast_instance_f32 g_rfft_instance;
-// 原始时域输入，放在 CCM 中减少和 DMA 区域的冲突。
+// 加窗后的时域输入（供 FFT 使用），放在 CCM 中。
 extern float32_t rfft_input[FFT_LENGTH];
+// 去直流、未加窗的纯交流时域信号（供过零触发和波形显示使用）。
+extern float32_t rfft_time_domain[FFT_LENGTH];
 // CMSIS-DSP 输出的复数域临时缓冲。
 extern float32_t rfft_output_complex[FFT_LENGTH];
 // 每个频点的幅值谱，供基波和谐波搜索使用。
