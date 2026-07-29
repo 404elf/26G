@@ -5,6 +5,7 @@
 #include "adc.h"
 #include "tim.h"
 #include "VCA821.h"
+#include "sig_util.h"
 
 // 原始 DMA 缓冲区放在 IRAM2，便于和主内存分离。
 uint32_t adc_dma_buf[ADC_DMA_WORDS] __attribute__((section(".iram2")));

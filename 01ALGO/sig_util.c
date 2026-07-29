@@ -3,6 +3,7 @@
 #include <math.h>
 
 #include "FFT.h"
+#include "adc_measure.h"
 
 // 频率补偿 LUT：根据频率修正前端幅值衰减。
 #define SIG_LUT_POINTS 51U

@@ -10,13 +10,18 @@
 // 屏幕显示数据放在 IRAM1，减少和 DMA/FFT 缓冲区的冲突。
 SerialScreenData_t g_screen_data __attribute__((section(".iram1")));
 
+// 保命参数：采样等待超时和谐波噪声门限。
+static const uint32_t TASK_SAMPLE_TIMEOUT_MS = 10U;
+static const float32_t TASK_HARMONIC_NOISE_FLOOR_V = 0.002f;
+
 // 串口命令缓冲：用于识别简单控制指令，例如波形显示模式切换。
 static char g_serial_cmd_buffer[12];
 static uint8_t g_serial_cmd_length = 0;
 
 static void Task_ResetScreenData(void)
 {
-	// 清空本帧显示数据，但保留当前波形显示模式。
+	// 每一帧开始前先清掉上一帧的结果，避免旧数据残留到屏幕上。
+	// 这里只保留波形显示模式，因为这是用户手动切换的状态。
 	uint8_t wave_mode = g_screen_data.wave_disp_mode;
 	memset(&g_screen_data, 0, sizeof(g_screen_data));
 	g_screen_data.wave_disp_mode = (wave_mode == 3U) ? 3U : 1U;
@@ -24,7 +29,8 @@ static void Task_ResetScreenData(void)
 
 static void Task_UpdateSpectrumBars(uint8_t harmonic_count)
 {
-	// 把谐波幅值换算成屏幕柱状图高度。
+	// 这里把“第几个谐波 + 它有多强”转成屏幕上要画的柱子位置和高度。
+	// X 坐标表示第几个谐波，Y 坐标表示柱子的高度。
 	for (uint8_t i = 0; i < 4U; i++) {
 		if (i < harmonic_count) {
 			g_screen_data.spec_bar_x[i] = (uint16_t)(24U + (uint16_t)i * 28U);
@@ -43,79 +49,128 @@ static void Task_UpdateSpectrumBars(uint8_t harmonic_count)
 	}
 }
 
+static uint8_t Task_IsAboveNoiseFloor(float32_t peak_mag, float32_t linear_gain)
+{
+	// 这一步是“防误判”的保险丝：先估算这个峰大约有多大，再决定它是不是有效谐波。
+	// 如果算出来的幅值太小，就直接认为它只是噪声，不继续做精细插值。
+	float32_t gain = (linear_gain > 0.0f) ? linear_gain : 1.0f;
+	float32_t estimated_amp = (peak_mag / (float32_t)FFT_BIN_COUNT) * 2.0f / gain;
+	return (estimated_amp >= TASK_HARMONIC_NOISE_FLOOR_V) ? 1U : 0U;
+}
+
 void Task_Signal_Processing(void)
 {
-	// 1. 触发一次新的采样。
+	// ===== 第一段：准备采样 =====
+	// 先锁定这次采样对应的前端增益。
+	// 原因很简单：如果 VCA821 在采样前后刚切过档，那么后面的幅值、Vpp 都必须用同一个增益去算。
+	float gain_snapshot = VCA821_GetLinearGain();
+
+	// 触发 ADC + DMA 开始收这一帧数据。
 	ADC_Measure_Start();
 
-	// 2. 等待 DMA 数据就绪，超时后直接进入下一轮。
+	// ===== 第二段：等待采样完成 =====
+	// 等待 DMA 全帧完成中断把 adc_buffer_ready 置成 2。
+	// 如果硬件异常、触发链断了、或者采样没正常结束，就在超时后退出，避免主循环死等。
 	uint32_t wait_start = HAL_GetTick();
-	while (adc_buffer_ready != 2U) {
-		if ((HAL_GetTick() - wait_start) > 10U) {
-			break;
-		}
+	while ((adc_buffer_ready != 2U) && ((HAL_GetTick() - wait_start) < TASK_SAMPLE_TIMEOUT_MS)) {
 	}
+	if (adc_buffer_ready != 2U) {
+		// 超时说明这一帧数据不可信，直接停止并重新初始化采样状态。
+		ADC_Measure_Stop();
+		ADC_Measure_Init();
+		Task_ResetScreenData();
+		return;
+	}
+	// 数据已经完整到位，清掉就绪标志，准备下一轮。
 	adc_buffer_ready = 0U;
 
-	// 3. 先做 FFT，再找基波和谐波。
-	float gain = VCA821_GetLinearGain();
+	// ===== 第三段：做频域分析 =====
+	// 把 DMA 原始数据拆开、加窗、做 FFT。
+	// 这一步之后，rfft_mag 里就是整帧信号的频谱了。
+	FFT_Process_Unpack(adc_dma_buf, gain_snapshot);
 
-	FFT_Process_Unpack(adc_dma_buf, gain);
-
+	// 先在基波可能出现的范围里找最大峰。
+	// 这里得到的是“最像基波”的频点，不是最终精确值。
 	int k_base = FFT_Find_Max_Bin(rfft_mag, 5, 285);
 	if (k_base < 1) {
+		// 连基波都没找到，说明这一帧数据不可靠或者信号过弱，直接清屏并返回。
 		Task_ResetScreenData();
 		return;
 	}
 
-	// 4. 估计基波频率和幅值，并做前端补偿。
+	// 用 Rife 插值把基波频率和幅值再细化一下。
+	// 这样比直接拿整 bin 的峰值更准确。
 	float32_t f1 = 0.0f;
 	float32_t A1 = 0.0f;
 	FFT_Rife_Interpolate(k_base, &f1, &A1);
+	// 幅值补偿：把前端频响造成的衰减补回来。
 	A1 = SIG_Apply_LUT_Compensation(f1, A1);
 
+	// ===== 第四段：组织显示用的基础结果 =====
+	// 先清空上一帧结果，再把基波写进屏幕数据结构。
 	Task_ResetScreenData();
 	g_screen_data.f1_base_freq = f1;
 	g_screen_data.harmonic_count = 1U;
 	g_screen_data.harmonic_freq[0] = f1 / 1000.0f;
 	g_screen_data.harmonic_amp[0] = A1 * 1000.0f;
 
-	// 5. 继续搜索 2~4 次谐波。
+	// ===== 第五段：搜索谐波 =====
+	// 下面按 2f1、3f1、4f1 逐个找谐波。
+	// 先局部寻峰，再做噪声门限判断，最后才做精细插值。
 	uint8_t h_count = 1U;
 	for (uint8_t harmonic = 2U; harmonic <= 4U; harmonic++) {
+		// 理论谐波频率。
 		float32_t f_target = f1 * (float32_t)harmonic;
 		if (f_target > 500000.0f) {
+			// 超出有效范围就不用继续找了。
 			break;
 		}
 
+		// 在理论位置附近找一个局部最大值。
 		int bin_target = (int)(f_target / FFT_BIN_WIDTH_HZ);
 		int k_h = FFT_Find_Local_Max_Bin(rfft_mag, bin_target - 3, bin_target + 3);
 		if (k_h < 1) {
+			// 这附近根本没有像样的峰，说明该次谐波不存在或太弱。
 			continue;
 		}
 
+		// 先做噪声门限判断，避免把底噪当谐波。
+		if (!Task_IsAboveNoiseFloor(rfft_mag[k_h], gain_snapshot)) {
+			// 峰太小就直接忽略，不再做 Rife 拟合。
+			continue;
+		}
+
+		// 通过门限后，再用 Rife 算出更准确的谐波频率和幅值。
 		float32_t fh = 0.0f;
 		float32_t Ah = 0.0f;
 		FFT_Rife_Interpolate(k_h, &fh, &Ah);
+		// 同样做一次补偿，保持各次谐波口径一致。
 		Ah = SIG_Apply_LUT_Compensation(fh, Ah);
 
 		if (Ah * 1000.0f > 3.0f && h_count < 4U) {
+			// 只有幅值足够明显的谐波才写入屏幕数据。
 			g_screen_data.harmonic_freq[h_count] = fh / 1000.0f;
 			g_screen_data.harmonic_amp[h_count] = Ah * 1000.0f;
 			h_count++;
 		}
 	}
 
-	// 6. 计算总 RMS / 峰峰值，并生成波形显示数据。
+	// ===== 第六段：计算时域指标 =====
+	// 谐波幅值已经有了，接下来把它们合成总 RMS。
+	// Vpp 则直接从原始 DMA 数据里统计最大最小值得到。
 	g_screen_data.harmonic_count = h_count;
 	g_screen_data.Vrms_val = SIG_Calculate_TrueRMS(g_screen_data.harmonic_amp, h_count);
-	g_screen_data.Vpp_val = SIG_Calculate_Vpp(adc_dma_buf, gain) * 1000.0f;
+	g_screen_data.Vpp_val = SIG_Calculate_Vpp(adc_dma_buf, gain_snapshot) * 1000.0f;
 
+	// ===== 第七段：生成波形显示数据 =====
+	// 根据基波周期决定屏幕上要画多少个点。
+	// 普通模式画 1 个周期，某些模式下画 3 个周期。
 	float32_t points_per_period = 7200000.0f / f1;
 	if (points_per_period < 2.0f) {
 		points_per_period = 2.0f;
 	}
 	uint16_t wave_points = (g_screen_data.wave_disp_mode == 3U) ? (uint16_t)(3.0f * points_per_period) : (uint16_t)points_per_period;
+	// 波形点数太少会看不清，太多则没必要。
 	if (wave_points < 2U) {
 		wave_points = 2U;
 	}
@@ -123,18 +178,25 @@ void Task_Signal_Processing(void)
 		wave_points = FFT_LENGTH;
 	}
 
+	// 从一个比较稳定的零交点开始截取波形，方便屏幕上显示对齐。
 	int n_start = SIG_Find_Hysteresis_ZeroCrossing(rfft_input, 1.65f);
 	if (n_start < 0) {
+		// 找不到合适零交点时，就从头开始。
 		n_start = 0;
 	}
 	if ((uint16_t)n_start + wave_points > FFT_LENGTH) {
+		// 保证截取长度不会越界。
 		n_start = (int)(FFT_LENGTH - wave_points);
 	}
 
+	// 把原始波形重采样成 120 个屏幕点。
+	// 这样屏幕上看到的波形更平滑，也更适合显示。
 	SIG_CubicSpline_Resample(&rfft_input[n_start], wave_points, g_screen_data.wave_pixels, 120U);
+	// 柱状图则由谐波幅值直接生成。
 	Task_UpdateSpectrumBars(h_count);
 
-	// 7. 把本帧结果交给屏幕发送层。
+	// ===== 第八段：交给显示层 =====
+	// 这一层只负责把整理好的结果交出去，不关心具体协议怎么发。
 	SerialScreen_Render_Task(&g_screen_data);
 }
 
@@ -146,23 +208,27 @@ void SerialScreen_Render_Task(const SerialScreenData_t *data)
 
 void SerialScreen_Rx_Handler(uint8_t rx_byte)
 {
-	// 接收一小段命令字符串，用于识别简单控制指令。
+	// 串口命令是“边收边拼”的，方便识别类似 W1 / W3 这种简单控制指令。
 	if (rx_byte == '\r' || rx_byte == '\n' || rx_byte == 0xFFU) {
+		// 一行命令结束，清空缓冲区，准备接收下一条。
 		g_serial_cmd_length = 0U;
 		g_serial_cmd_buffer[0] = '\0';
 		return;
 	}
 
+	// 缓冲区没满就直接追加。
 	if (g_serial_cmd_length < (sizeof(g_serial_cmd_buffer) - 1U)) {
 		g_serial_cmd_buffer[g_serial_cmd_length++] = (char)rx_byte;
 		g_serial_cmd_buffer[g_serial_cmd_length] = '\0';
 	} else {
+		// 满了就左移一位，保留最近收到的命令内容。
 		memmove(g_serial_cmd_buffer, &g_serial_cmd_buffer[1], sizeof(g_serial_cmd_buffer) - 2U);
 		g_serial_cmd_buffer[sizeof(g_serial_cmd_buffer) - 2U] = (char)rx_byte;
 		g_serial_cmd_buffer[sizeof(g_serial_cmd_buffer) - 1U] = '\0';
 		g_serial_cmd_length = (uint8_t)(sizeof(g_serial_cmd_buffer) - 1U);
 	}
 
+	// 收到 1 或 W1 / T1，就切到单周期显示。
 	if (rx_byte == '1' || strstr(g_serial_cmd_buffer, "W1") != NULL || strstr(g_serial_cmd_buffer, "T1") != NULL) {
 		g_screen_data.wave_disp_mode = 1U;
 		g_serial_cmd_length = 0U;
@@ -170,6 +236,7 @@ void SerialScreen_Rx_Handler(uint8_t rx_byte)
 		return;
 	}
 
+	// 收到 3 或 W3 / T3，就切到三周期显示。
 	if (rx_byte == '3' || strstr(g_serial_cmd_buffer, "W3") != NULL || strstr(g_serial_cmd_buffer, "T3") != NULL) {
 		g_screen_data.wave_disp_mode = 3U;
 		g_serial_cmd_length = 0U;
