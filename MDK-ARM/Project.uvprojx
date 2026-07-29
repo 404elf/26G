@@ -931,11 +931,6 @@
               <FilePath>..\00APP\app_main.c</FilePath>
             </File>
             <File>
-              <FileName>test.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\00APP\test.c</FilePath>
-            </File>
-            <File>
               <FileName>tasks.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\00APP\tasks.c</FilePath>
@@ -951,11 +946,6 @@
               <FilePath>..\01ALGO\FFT.c</FilePath>
             </File>
             <File>
-              <FileName>IQ.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\01ALGO\IQ.c</FilePath>
-            </File>
-            <File>
               <FileName>sig_util.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\01ALGO\sig_util.c</FilePath>
@@ -965,16 +955,6 @@
         <Group>
           <GroupName>02BSP</GroupName>
           <Files>
-            <File>
-              <FileName>AD985x.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\02BSP\AD985x.c</FilePath>
-            </File>
-            <File>
-              <FileName>OLED.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\02BSP\OLED.c</FilePath>
-            </File>
             <File>
               <FileName>VCA821.c</FileName>
               <FileType>1</FileType>
@@ -989,11 +969,6 @@
               <FileName>adc_measure.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\03DRV\adc_measure.c</FilePath>
-            </File>
-            <File>
-              <FileName>signal_gen.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\03DRV\signal_gen.c</FilePath>
             </File>
           </Files>
         </Group>
