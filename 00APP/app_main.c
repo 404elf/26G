@@ -18,20 +18,16 @@ static uint32_t last_press_tick = 0;   // 按键去抖计时
 
 //函数实现  
 void app_init(void) {
-    OLED_Init();
+   
     FFT_Init();
-    Init_SineRef();
-
-    AD985x_Init(AD9850, SERIAL);
-    AD985x_SetFre_Phase(1800000.0f, 0);
 
     ADC_Measure_Start();
-    SignalGen_Start(0.0f);
+
     VGA_SetVoltage(1.0f);
 
     //开启时钟（顺手清零）
-    __HAL_TIM_SET_COUNTER(&htim2,0);
-    HAL_TIM_Base_Start(&htim2);
+    __HAL_TIM_SET_COUNTER(&htim8,0);
+    HAL_TIM_Base_Start(&htim8);
 
 }
 
@@ -48,9 +44,7 @@ void app_loop(void) {
     switch (key_flag){
         case TASK_Init:
             if (!init_once) {
-                OLED_ClearBuffer();
-                OLED_ShowString(0, 0, "Press to start", 1);//其实没意义，立马就被刷新了
-                OLED_Refresh();
+
                 init_once = 1;
             }
             break;
@@ -66,10 +60,6 @@ void app_loop(void) {
             if (tab_flag) TaskC_Init();
             TaskC_Loop(); 
             break;
-        case TaskD:
-            if (tab_flag) TaskD_Init();
-            TaskD_Loop();
-            break;
         default: break;
     }
 }
@@ -83,12 +73,12 @@ void Key_handler(uint16_t GPIO_Pin) {
         case GPIO_PIN_0:
             // 上一个模式：TaskD → TaskC → TaskB → TaskA → TaskD
             if (key_flag > TaskA) key_flag = (MachineTaskMode_t)(key_flag - 1);
-            else                  key_flag = TaskD;
+            else                  key_flag = TaskC;
             break;
 
         case GPIO_PIN_1:
             // 下一个模式：TaskA → TaskB → TaskC → TaskD → TaskA
-            if (key_flag < TaskD) key_flag = (MachineTaskMode_t)(key_flag + 1);
+            if (key_flag < TaskC) key_flag = (MachineTaskMode_t)(key_flag + 1);
             else                  key_flag = TaskA;
             break;
 
@@ -123,14 +113,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
 // 通道 2 半传输完成中断回调
 void HAL_DACEx_ConvHalfCpltCallbackCh2(DAC_HandleTypeDef *hdac) {
     if (hdac->Instance == DAC) { // 部分芯片为 DAC1
-        SignalGen_DAC_HalfCpltCallback();
+
     }
 }
 
 // 通道 2 传输完成中断回调
 void HAL_DACEx_ConvCpltCallbackCh2(DAC_HandleTypeDef *hdac) {
     if (hdac->Instance == DAC) {
-        SignalGen_DAC_FullCpltCallback();
+
     }
 }
 

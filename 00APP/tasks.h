@@ -15,8 +15,6 @@ void TaskB_Loop(void);
 void TaskC_Init(void);
 void TaskC_Loop(void);
 
-/* Task D ¡ª Êý×Ö½âµ÷ (2ASK/2FSK/2PSK) */
-void TaskD_Init(void);
-void TaskD_Loop(void);
+
 
 #endif /* __TASKS_H */
