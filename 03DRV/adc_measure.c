@@ -27,7 +27,9 @@ void ADC_Measure_Init(void)
 
 void ADC_Measure_Start(void)
 {
-    // 单次触发：每次调用重新启动 DMA。
+    // 单次触发：先停掉上次转换，再重新启动 DMA。
+    (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
+    (void)HAL_TIM_Base_Stop(&htim8);
     ADC_Measure_ClearState();
     if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS) == HAL_OK) {
         (void)HAL_TIM_Base_Start(&htim8);

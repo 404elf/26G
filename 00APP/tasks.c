@@ -1,5 +1,6 @@
 #include "tasks.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "FFT.h"
@@ -60,6 +61,7 @@ static uint8_t Task_IsAboveNoiseFloor(float32_t peak_mag, float32_t linear_gain)
 
 void Task_Signal_Processing(void)
 {
+	static uint32_t frame_cnt = 0;
 	// ===== 第一段：准备采样 =====
 	float gain_snapshot = VCA821_GetLinearGain();
 
@@ -201,6 +203,16 @@ void Task_Signal_Processing(void)
 	// ===== 第八段：交给显示层 =====
 	// 这一层只负责把整理好的结果交出去，不关心具体协议怎么发。
 	SerialScreen_Render_Task(&g_screen_data);
+
+	// ===== FireWater 协议输出 =====
+	// 格式：每行逗号分隔，换行触发 FireWater 绘图。
+	// 计数测试：:frame, … , f1_kHz, Vpp_V, Vrms_V
+	printf(":cnt,%lu,:f1,%.1f,:Vpp,%.3f,:Vrms,%.3f\n",
+	       (unsigned long)frame_cnt,
+	       g_screen_data.f1_base_freq / 1000.0f,
+	       g_screen_data.Vpp_val / 1000.0f,
+	       g_screen_data.Vrms_val / 1000.0f);
+	frame_cnt++;
 }
 
 void SerialScreen_Render_Task(const SerialScreenData_t *data)
@@ -247,6 +259,34 @@ void SerialScreen_Rx_Handler(uint8_t rx_byte)
 	}
 }
 
+/*
+ * printf 串口重定向（前提：CubeMX 中配好 USART1，hal_conf.h 中启用 HAL_UART_MODULE_ENABLED）
+ * 配置完成后，printf / SerialScreen_Render_Task 均可直接发数据到串口助手。
+ */
+extern UART_HandleTypeDef huart1;
 
+int fputc(int ch, FILE *f)
+{
+	(void)f;
+	HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
+	return ch;
+}
 
+// ==================== 陶晶驰串口屏 ====================
+
+static void UART_SendByte(uint8_t byte)
+{
+	HAL_UART_Transmit(&huart1, &byte, 1, 0xFFFF);
+}
+
+// 发送指令到陶晶驰串口屏（ASCII 串 + 3 字节 0xFF 帧尾）
+void HMISendString(char *str)
+{
+	while (*str) {
+		UART_SendByte((uint8_t)*str++);
+	}
+	UART_SendByte(0xFF);
+	UART_SendByte(0xFF);
+	UART_SendByte(0xFF);
+}
 
