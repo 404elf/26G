@@ -29,21 +29,30 @@ void ADC_Measure_Init(void)
 
 void ADC_Measure_Start(void)
 {
-    volatile HAL_StatusTypeDef st;
+    adc_buffer_ready = 0U;
 
-    ADC_Measure_ClearState();
-    st = HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS);
-    if (st == HAL_OK) {
-        (void)HAL_TIM_Base_Start(&htim8);
-    }
-    // 断点设这里看 st：HAL_OK=0, HAL_ERROR=1, HAL_BUSY=2, HAL_TIMEOUT=3
-    (void)st;
+    // 1. 停止上一轮
+    HAL_ADCEx_MultiModeStop_DMA(&hadc1);
+    HAL_ADC_Stop(&hadc2);
+    HAL_ADC_Stop(&hadc3);
+
+    // 2. 三重交错模式必须先手动启动从机 ADC2、ADC3
+    HAL_ADC_Start(&hadc2);
+    HAL_ADC_Start(&hadc3);
+
+    // 3. 启动主机 ADC1 + DMA
+    HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS);
+
+    // 4. 启动定时器触发源
+    HAL_TIM_Base_Start(&htim8);
 }
 
 void ADC_Measure_Stop(void)
 {
     (void)HAL_TIM_Base_Stop(&htim8);
     (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
+    (void)HAL_ADC_Stop(&hadc2);
+    (void)HAL_ADC_Stop(&hadc3);
     ADC_Measure_ClearState();
 }
 
