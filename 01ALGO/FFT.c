@@ -16,6 +16,9 @@ float32_t rfft_output_complex[FFT_LENGTH];
 // 幅值谱，后续基波/谐波搜索都直接读这个数组。
 float32_t rfft_mag[FFT_BIN_COUNT] __attribute__((section(".ccmram")));
 
+// 预生成的 Hann 窗系数表（只读数据放 IRAM1，避免每帧重复计算 arm_cos_f32）。
+static float32_t hann_window[FFT_LENGTH] __attribute__((section(".iram1")));
+
 // 增益保护：避免前端增益异常时把幅值算坏。
 static float32_t FFT_ClampGain(float32_t gain)
 {
@@ -26,6 +29,11 @@ void FFT_Init(void)
 {
   // 只初始化一次 FFT 实例，后续帧循环复用。
   (void)arm_rfft_fast_init_f32(&g_rfft_instance, FFT_LENGTH);
+
+  // 预生成 Hann 窗系数表，后续每帧直接查表，避免反复调用 arm_cos_f32。
+  for (uint32_t i = 0; i < FFT_LENGTH; i++) {
+    hann_window[i] = 0.5f * (1.0f - arm_cos_f32((2.0f * 3.14159265358979323846f * (float32_t)i) / (float32_t)FFT_LENGTH));
+  }
 }
 
 // 搜索 bin 时先把下标夹紧到合法范围，避免越界。
@@ -103,9 +111,8 @@ void FFT_Process_Unpack(const uint32_t *dma_buf, float linear_gain)
     // 未加窗版本：留给过零触发和波形显示。
     rfft_time_domain[i] = ac_v;
 
-    // 加 Hann 窗版本：留给 FFT 频域分析。
-    float32_t window = 0.5f * (1.0f - arm_cos_f32((2.0f * 3.14159265358979323846f * (float32_t)i) / (float32_t)FFT_LENGTH));
-    rfft_input[i] = ac_v * window;
+    // 加 Hann 窗版本（查表法）：留给 FFT 频域分析。
+    rfft_input[i] = ac_v * hann_window[i];
   }
 
   arm_rfft_fast_f32(&g_rfft_instance, rfft_input, rfft_output_complex, 0);

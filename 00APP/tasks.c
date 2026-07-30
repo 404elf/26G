@@ -110,8 +110,8 @@ void Task_Signal_Processing(void)
 	float32_t f1 = 0.0f;
 	float32_t A1 = 0.0f;
 	FFT_Rife_Interpolate(k_base, &f1, &A1);
-	// 幅值补偿：把前端频响造成的衰减补回来。
-	A1 = SIG_Apply_LUT_Compensation(f1, A1);
+	// 幅值补偿暂关：先用未经 LUT 修正的结果做验证。
+	// A1 = SIG_Apply_LUT_Compensation(f1, A1);
 
 	// ===== 第四段：组织显示用的基础结果 =====
 	// 先清空上一帧结果，再把基波写进屏幕数据结构。
@@ -160,8 +160,8 @@ void Task_Signal_Processing(void)
 		float32_t fh = 0.0f;
 		float32_t Ah = 0.0f;
 		FFT_Rife_Interpolate(k_h, &fh, &Ah);
-		// 同样做一次补偿，保持各次谐波口径一致。
-		Ah = SIG_Apply_LUT_Compensation(fh, Ah);
+		// 同样做一次补偿，保持各次谐波口径一致（暂关）。
+		// Ah = SIG_Apply_LUT_Compensation(fh, Ah);
 
 		if (Ah * 1000.0f > 3.0f) {
 			// 只有幅值足够明显的谐波才写入屏幕数据。
