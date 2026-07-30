@@ -82,25 +82,22 @@ void FFT_Process_Unpack(const uint32_t *dma_buf, float linear_gain)
     return;
   }
 
-  // ===== 第一遍：解包并累加，求本帧真实直流偏置 =====
-  float32_t v_sum = 0.0f;
+  // ===== 第一遍：解包、存电压 + 整数累加码值（避免循环内浮点） =====
+  uint32_t code_sum = 0;
   for (uint32_t word_index = 0; word_index < ADC_DMA_WORDS; word_index++) {
     uint32_t packed = dma_buf[word_index];
     uint16_t sample_early = (uint16_t)(packed & 0xFFFFU) & 0x0FFFU;
     uint16_t sample_late = (uint16_t)((packed >> 16U) & 0xFFFFU) & 0x0FFFU;
 
-    uint32_t sample_index = word_index * 2U;
-    float32_t v_early = (float32_t)sample_early * 3.3f / 4096.0f;
-    float32_t v_late  = (float32_t)sample_late  * 3.3f / 4096.0f;
+    code_sum += (uint32_t)sample_early + (uint32_t)sample_late;
 
-    // 暂存原始电压值，用于第二遍去直流。
-    rfft_input[sample_index]     = v_early;
-    rfft_input[sample_index + 1U] = v_late;
-    v_sum += v_early + v_late;
+    uint32_t sample_index = word_index * 2U;
+    rfft_input[sample_index]     = (float32_t)sample_early * 3.3f / 4096.0f;
+    rfft_input[sample_index + 1U] = (float32_t)sample_late  * 3.3f / 4096.0f;
   }
 
-  // 本帧真实平均直流偏置（适应硬件容差和温漂）。
-  float32_t V_avg = v_sum / (float32_t)FFT_LENGTH;
+  // 本帧真实平均直流偏置（用整数码值累加，最后一次性换算，省去 4096 次浮点加）。
+  float32_t V_avg = (float32_t)code_sum * 3.3f / 4096.0f / (float32_t)FFT_LENGTH;
   (void)linear_gain;
 
   // ===== 第二遍：去直流归零 → 存 time_domain；加 Hann 窗 → 存 rfft_input =====
@@ -123,7 +120,7 @@ void FFT_Process_Unpack(const uint32_t *dma_buf, float linear_gain)
   arm_cmplx_mag_f32(&rfft_output_complex[2], &rfft_mag[1], FFT_BIN_COUNT - 1U);
 }
 
-void FFT_Rife_Interpolate(int bin_center, float32_t *out_freq, float32_t *out_amp)
+void FFT_Rife_Interpolate(int bin_center, float32_t *out_freq, float32_t *out_amp, float linear_gain)
 {
   if (out_freq == NULL || out_amp == NULL) {
     return;
@@ -191,7 +188,7 @@ void FFT_Rife_Interpolate(int bin_center, float32_t *out_freq, float32_t *out_am
     corr *= (1.0f - delta * delta);
   }
 
-  float32_t gain = FFT_ClampGain(g_vca821_linear_gain);
+  float32_t gain = FFT_ClampGain(linear_gain);
   *out_freq = ((float32_t)k_max + ((float32_t)direction * delta)) * FFT_BIN_WIDTH_HZ;
   *out_amp = ((a_max * corr) / (float32_t)FFT_BIN_COUNT) * 2.0f / gain;
 }

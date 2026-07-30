@@ -17,10 +17,6 @@ void VCA821_SetGain(float gain_dB);
 // 返回当前线性增益值，供幅值补偿使用。
 float VCA821_GetLinearGain(void);
 
-// 保留旧版慢速 AGC 接口，兼容已有工程调用。
-void Run_Slow_AGC(void);
-// 200ms 周期的慢速 AGC。
-void Run_Slow_AGC_200ms(void);
 // 直接按电压设置增益控制值。
 void VGA_SetVoltage(float voltage);
 

@@ -28,7 +28,7 @@ void FFT_Init(void);
 // 把 DMA 数据展开成时域信号，再做窗函数和 FFT。
 void FFT_Process_Unpack(const uint32_t *dma_buf, float linear_gain);
 // 对当前峰值附近做细化插值，得到更准确的频率和幅值。
-void FFT_Rife_Interpolate(int bin_center, float32_t *out_freq, float32_t *out_amp);
+void FFT_Rife_Interpolate(int bin_center, float32_t *out_freq, float32_t *out_amp, float linear_gain);
 // 在指定 bin 范围内找幅值最大的点。
 int FFT_Find_Max_Bin(const float32_t *mag, int start_bin, int end_bin);
 // 谐波搜索时使用的局部峰值搜索接口，便于语义区分。

@@ -124,7 +124,7 @@ int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg)
 
 	const float32_t v_hyst = 0.02f;
 	// 用迟滞条件找上升沿零交点，避免噪声导致误触发。
-	for (uint32_t index = 0; index + 1U < FFT_BIN_COUNT; index++) {
+	for (uint32_t index = 0; index + 1U < FFT_LENGTH; index++) {
 		float32_t current = unpacked_v[index];
 		float32_t next = unpacked_v[index + 1U];
 		if (current < (V_avg - v_hyst) && next >= (V_avg + v_hyst)) {

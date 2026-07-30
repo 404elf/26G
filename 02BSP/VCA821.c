@@ -46,7 +46,8 @@ void VCA821_Init(void)
   }
 
   g_vca821_started = 1;
-  VCA821_SetGain(6.0f);
+  // 暂关增益放大：先用 0 dB 直通测试原生信号，恢复时改回 VCA821_SetGain(6.0f)。
+  // VCA821_SetGain(6.0f);
 }
 
 void VCA821_SetGain(float gain_dB)
@@ -64,17 +65,6 @@ float VCA821_GetLinearGain(void)
   return (g_vca821_linear_gain > 0.0f) ? g_vca821_linear_gain : 1.0f;
 }
 
-void Run_Slow_AGC(void)
-{
-  // 通过当前 Vpp 粗略判断增益是偏低还是偏高。
-  float current_vpp = Get_Vpp();
-  if (current_vpp < 1.46f) {
-    VGA_SetVoltage(1.8f);
-  } else if (current_vpp > 1.54f) {
-    VGA_SetVoltage(1.0f);
-  }
-}
-
 void VGA_SetVoltage(float voltage)
 {
   // 外部如果直接给控制电压，这里也同步更新线性增益。
@@ -84,13 +74,3 @@ void VGA_SetVoltage(float voltage)
   VCA821_ApplyVoltage(clamped_voltage);
 }
 
-void Run_Slow_AGC_200ms(void)
-{
-  // 限制 AGC 调整频率，避免太快抖动。
-  uint32_t now = HAL_GetTick();
-  if (now - g_last_agc_ms < 200U) {
-    return;
-  }
-  g_last_agc_ms = now;
-  Run_Slow_AGC();
-}

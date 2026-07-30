@@ -109,7 +109,7 @@ void Task_Signal_Processing(void)
 	// 这样比直接拿整 bin 的峰值更准确。
 	float32_t f1 = 0.0f;
 	float32_t A1 = 0.0f;
-	FFT_Rife_Interpolate(k_base, &f1, &A1);
+	FFT_Rife_Interpolate(k_base, &f1, &A1, gain_snapshot);
 	// 幅值补偿暂关：先用未经 LUT 修正的结果做验证。
 	// A1 = SIG_Apply_LUT_Compensation(f1, A1);
 
@@ -159,11 +159,11 @@ void Task_Signal_Processing(void)
 		// 通过门限后，再用 Rife 算出更准确的谐波频率和幅值。
 		float32_t fh = 0.0f;
 		float32_t Ah = 0.0f;
-		FFT_Rife_Interpolate(k_h, &fh, &Ah);
+		FFT_Rife_Interpolate(k_h, &fh, &Ah, gain_snapshot);
 		// 同样做一次补偿，保持各次谐波口径一致（暂关）。
 		// Ah = SIG_Apply_LUT_Compensation(fh, Ah);
 
-		if (Ah * 1000.0f > 3.0f) {
+		if (Ah * 1000.0f > 5.0f) {
 			// 只有幅值足够明显的谐波才写入屏幕数据。
 			g_screen_data.harmonic_freq[h_count] = fh / 1000.0f;
 			g_screen_data.harmonic_amp[h_count] = Ah * 1000.0f;
@@ -181,7 +181,7 @@ void Task_Signal_Processing(void)
 	// ===== 第七段：生成波形显示数据 =====
 	// 根据基波周期决定屏幕上要画多少个点。
 	// 普通模式画 1 个周期，某些模式下画 3 个周期。
-	float32_t points_per_period = 7200000.0f / f1;
+	float32_t points_per_period = FFT_SAMPLE_RATE_HZ / f1;
 	if (points_per_period < 2.0f) {
 		points_per_period = 2.0f;
 	}
