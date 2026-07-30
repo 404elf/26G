@@ -9,6 +9,8 @@
 
 // 原始 DMA 缓冲区放在 IRAM2，便于和主内存分离。
 uint32_t adc_dma_buf[ADC_DMA_WORDS] __attribute__((section(".iram2")));
+// FullCplt 时从 DMA 区拷贝到此处（IRAM1），任务层安全读取。
+uint32_t adc_safe_buf[ADC_DMA_WORDS] __attribute__((section(".iram1")));
 
 // 采样完成标志：由 ADC FullCplt 回调置 1，任务层轮询读取。
 volatile uint8_t adc_buffer_ready = 0;
@@ -27,19 +29,15 @@ void ADC_Measure_Init(void)
 
 void ADC_Measure_Start(void)
 {
-    HAL_StatusTypeDef status;
-
-    // 先停再启（Stop 对未启动的 ADC 安全，会直接返回）
-    (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
-    (void)HAL_TIM_Base_Stop(&htim8);
+    volatile HAL_StatusTypeDef st;
 
     ADC_Measure_ClearState();
-    status = HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS);
-    if (status == HAL_OK) {
+    st = HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS);
+    if (st == HAL_OK) {
         (void)HAL_TIM_Base_Start(&htim8);
     }
-    // status != HAL_OK 说明 ADC/DMA 配错了或状态机不对，调试时在这里设断点看返回值
-    (void)status;
+    // 断点设这里看 st：HAL_OK=0, HAL_ERROR=1, HAL_BUSY=2, HAL_TIMEOUT=3
+    (void)st;
 }
 
 void ADC_Measure_Stop(void)
@@ -83,6 +81,7 @@ void Measure_ADC_HalfCpltCallback(void)
 
 void Measure_ADC_FullCpltCallback(void)
 {
-    // DMA 全传输完成，整帧数据已就绪。
+    // DMA FullCplt：先快照到安全区，再置标志，避免任务层读到 DMA 正在覆盖的数据。
+    memcpy(adc_safe_buf, adc_dma_buf, sizeof(adc_safe_buf));
     adc_buffer_ready = 1;
 }

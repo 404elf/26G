@@ -12,6 +12,8 @@
 extern volatile uint8_t adc_buffer_ready;
 // ADC triple mode 的 DMA 原始缓冲区，放到 IRAM2。
 extern uint32_t adc_dma_buf[ADC_DMA_WORDS];
+// FullCplt 时拷贝到此缓冲区（IRAM1），任务层只读这里，避免 Circular DMA 竞态。
+extern uint32_t adc_safe_buf[ADC_DMA_WORDS];
 
 // 初始化采样缓冲和状态。
 void ADC_Measure_Init(void);

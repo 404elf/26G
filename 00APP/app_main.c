@@ -11,7 +11,7 @@ void VCA821_Init(void);
 
 void app_init(void)
 {
-    // 初始化采样、FFT 和前端增益，不立即启动采样（由任务层按需触发）。
+    // 只初始化，不启动采样——由 Task_Signal_Processing 统一管理 Start → Wait → Stop 周期。
     ADC_Measure_Init();
     FFT_Init();
     VCA821_Init();
@@ -63,4 +63,12 @@ void HAL_DACEx_ConvCpltCallbackCh2(DAC_HandleTypeDef *hdac)
 {
     // 当前未使用 DAC 中断回调，保留接口避免后续移植出错。
     (void)hdac;
+}
+/* 重写错误回调函数 (取消 __weak) */
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1) {
+        // 在这里打断点！如果停到了这里，说明 DMA 或 ADC 硬件报了 Error
+        __NOP(); 
+    }
 }

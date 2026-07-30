@@ -80,6 +80,9 @@ void Task_Signal_Processing(void)
 	}
 	adc_buffer_ready = 0U;
 
+	// DMA 已停（Normal 模式），但 ADC+TIM8 仍在跑，必须先停掉为下轮 Start 清状态。
+	ADC_Measure_Stop();
+
 	// ===== 第三段：做频域分析 =====
 	// DMA 已完成，直接处理 adc_dma_buf。
 	FFT_Process_Unpack(adc_dma_buf, gain_snapshot);
