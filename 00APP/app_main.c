@@ -11,11 +11,10 @@ void VCA821_Init(void);
 
 void app_init(void)
 {
-    // 先初始化采样、FFT 和前端增益，再启动 ADC 采集。
+    // 初始化采样、FFT 和前端增益，不立即启动采样（由任务层按需触发）。
     ADC_Measure_Init();
     FFT_Init();
     VCA821_Init();
-    ADC_Measure_Start();
 }
 
 void app_loop(void)

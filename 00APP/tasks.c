@@ -61,40 +61,26 @@ static uint8_t Task_IsAboveNoiseFloor(float32_t peak_mag, float32_t linear_gain)
 void Task_Signal_Processing(void)
 {
 	// ===== 第一段：准备采样 =====
-	// 先锁定这次采样对应的前端增益。
-	// 原因很简单：如果 VCA821 在采样前后刚切过档，那么后面的幅值、Vpp 都必须用同一个增益去算。
 	float gain_snapshot = VCA821_GetLinearGain();
 
-	// 触发 ADC + DMA 开始收这一帧数据。
+	// 单次触发 DMA，等它跑完再处理。
 	ADC_Measure_Start();
 
-	// ===== 第二段：等待采样完成（乒乓双缓冲） =====
-	// 等待 DMA 半帧/全帧完成中断把 adc_buffer_ready 置成 1 或 2。
-	// 1 → 前半帧 (adc_dma_buf[0..ADC_DMA_WORDS-1]) 就绪
-	// 2 → 后半帧 (adc_dma_buf[ADC_DMA_WORDS..]) 就绪
-	// 此时 DMA 正在写另一半，不会碰已完成的一半 → 读写安全。
-	// 如果硬件异常、触发链断了、或者采样没正常结束，就在超时后退出，避免主循环死等。
+	// ===== 第二段：等待 DMA 完成 =====
 	uint32_t wait_start = HAL_GetTick();
 	while ((adc_buffer_ready == 0U) && ((HAL_GetTick() - wait_start) < TASK_SAMPLE_TIMEOUT_MS)) {
 	}
 	if (adc_buffer_ready == 0U) {
-		// 超时说明这一帧数据不可信，直接停止并重新初始化采样状态。
 		ADC_Measure_Stop();
 		ADC_Measure_Init();
 		Task_ResetScreenData();
 		return;
 	}
-
-	// 根据就绪标志选择安全的半区指针。
-	// DMA 此时在写另一半，这一半不会被碰。
-	uint32_t *pActiveBuf = (adc_buffer_ready == 1U) ?
-	    &adc_dma_buf[0] : &adc_dma_buf[ADC_DMA_WORDS];
 	adc_buffer_ready = 0U;
 
 	// ===== 第三段：做频域分析 =====
-	// 把 DMA 原始数据拆开、加窗、做 FFT。
-	// 这一步之后，rfft_mag 里就是整帧信号的频谱了。
-	FFT_Process_Unpack(pActiveBuf, gain_snapshot);
+	// DMA 已完成，直接处理 adc_dma_buf。
+	FFT_Process_Unpack(adc_dma_buf, gain_snapshot);
 
 	// 先在基波可能出现的范围里找最大峰。
 	// 这里得到的是“最像基波”的频点，不是最终精确值。
@@ -176,7 +162,7 @@ void Task_Signal_Processing(void)
 	// Vpp 则直接从原始 DMA 数据里统计最大最小值得到。
 	g_screen_data.harmonic_count = h_count;
 	g_screen_data.Vrms_val = SIG_Calculate_TrueRMS(g_screen_data.harmonic_amp, h_count);
-	g_screen_data.Vpp_val = SIG_Calculate_Vpp(pActiveBuf, gain_snapshot) * 1000.0f;
+	g_screen_data.Vpp_val = SIG_Calculate_Vpp(adc_dma_buf, gain_snapshot) * 1000.0f;
 
 	// ===== 第七段：生成波形显示数据 =====
 	// 根据基波周期决定屏幕上要画多少个点。

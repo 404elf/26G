@@ -5,15 +5,13 @@
 
 #include "FFT.h"
 
-// DMA 半帧采样长度（一帧数据），和 FFT 输入长度保持一致。
+// 单帧 DMA 采样长度，和 FFT 输入长度保持一致。
 #define ADC_DMA_WORDS  2048U
-// 乒乓双缓冲总大小（半帧 × 2）。
-#define ADC_DMA_TOTAL  (ADC_DMA_WORDS * 2U)
 
-// 采样完成标志：0 未就绪，1 前半帧就绪，2 后半帧就绪。
+// 采样完成标志：0 未就绪，1 DMA 完成。
 extern volatile uint8_t adc_buffer_ready;
-// ADC triple mode 的 DMA 原始缓冲区（乒乓双缓冲），放到 IRAM2。
-extern uint32_t adc_dma_buf[ADC_DMA_TOTAL];
+// ADC triple mode 的 DMA 原始缓冲区，放到 IRAM2。
+extern uint32_t adc_dma_buf[ADC_DMA_WORDS];
 
 // 初始化采样缓冲和状态。
 void ADC_Measure_Init(void);

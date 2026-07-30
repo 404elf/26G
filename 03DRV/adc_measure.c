@@ -8,13 +8,12 @@
 #include "sig_util.h"
 
 // 原始 DMA 缓冲区放在 IRAM2，便于和主内存分离。
-uint32_t adc_dma_buf[ADC_DMA_TOTAL] __attribute__((section(".iram2")));
+uint32_t adc_dma_buf[ADC_DMA_WORDS] __attribute__((section(".iram2")));
 
-// 采样完成标志：由 ADC 回调更新，任务层轮询读取。
+// 采样完成标志：由 ADC FullCplt 回调置 1，任务层轮询读取。
 volatile uint8_t adc_buffer_ready = 0;
-static uint8_t g_adc_measure_started = 0;
 
-// 统一清理采样状态，避免旧帧标志残留。
+// 统一清理采样状态。
 static void ADC_Measure_ClearState(void)
 {
     adc_buffer_ready = 0;
@@ -22,36 +21,23 @@ static void ADC_Measure_ClearState(void)
 
 void ADC_Measure_Init(void)
 {
-    // 启动前先清空 DMA 缓冲和状态位。
     memset(adc_dma_buf, 0, sizeof(adc_dma_buf));
     ADC_Measure_ClearState();
-    g_adc_measure_started = 0;
 }
 
 void ADC_Measure_Start(void)
 {
-    // 已经启动时不重复开链路。
-    if (g_adc_measure_started) {
-        return;
-    }
-
+    // 单次触发：每次调用重新启动 DMA。
     ADC_Measure_ClearState();
-    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_TOTAL) == HAL_OK) {
+    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS) == HAL_OK) {
         (void)HAL_TIM_Base_Start(&htim8);
-        g_adc_measure_started = 1;
     }
 }
 
 void ADC_Measure_Stop(void)
 {
-    // 停止时同时关闭 TIM8 和 ADC DMA。
-    if (!g_adc_measure_started) {
-        return;
-    }
-
     (void)HAL_TIM_Base_Stop(&htim8);
     (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
-    g_adc_measure_started = 0;
     ADC_Measure_ClearState();
 }
 
@@ -84,12 +70,11 @@ float Get_Vpp(void)
 
 void Measure_ADC_HalfCpltCallback(void)
 {
-    // 半传输完成时先标记为 1，告诉任务层数据开始可读。
-    adc_buffer_ready = 1;
+    // 单次触发模式下不使用半回调，保留接口兼容。
 }
 
 void Measure_ADC_FullCpltCallback(void)
 {
-    // 全传输完成时标记为 2，表示整帧数据已经准备好。
-    adc_buffer_ready = 2;
+    // DMA 全传输完成，整帧数据已就绪。
+    adc_buffer_ready = 1;
 }
