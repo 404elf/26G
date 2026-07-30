@@ -27,13 +27,19 @@ void ADC_Measure_Init(void)
 
 void ADC_Measure_Start(void)
 {
-    // 单次触发：先停掉上次转换，再重新启动 DMA。
+    HAL_StatusTypeDef status;
+
+    // 先停再启（Stop 对未启动的 ADC 安全，会直接返回）
     (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
     (void)HAL_TIM_Base_Stop(&htim8);
+
     ADC_Measure_ClearState();
-    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS) == HAL_OK) {
+    status = HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS);
+    if (status == HAL_OK) {
         (void)HAL_TIM_Base_Start(&htim8);
     }
+    // status != HAL_OK 说明 ADC/DMA 配错了或状态机不对，调试时在这里设断点看返回值
+    (void)status;
 }
 
 void ADC_Measure_Stop(void)
