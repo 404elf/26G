@@ -29,7 +29,8 @@ static float32_t SIG_ClampFloat(float32_t value, float32_t min_value, float32_t 
 }
 
 // 有序插入一个新值，用来维护最小/最大样本集合。
-static void SIG_InsertAscending(float32_t *sorted_values, uint8_t count, float32_t value)
+// 用整数版替代原来的 float 版，避免循环内反复做浮点运算。
+static void SIG_InsertAscending_s32(int32_t *sorted_values, uint8_t count, int32_t value)
 {
 	uint8_t pos = count;
 	while (pos > 0U && sorted_values[pos - 1U] > value) {
@@ -39,8 +40,7 @@ static void SIG_InsertAscending(float32_t *sorted_values, uint8_t count, float32
 	sorted_values[pos] = value;
 }
 
-// 反向插入，维护最大的几个样本。
-static void SIG_InsertDescending(float32_t *sorted_values, uint8_t count, float32_t value)
+static void SIG_InsertDescending_s32(int32_t *sorted_values, uint8_t count, int32_t value)
 {
 	uint8_t pos = count;
 	while (pos > 0U && sorted_values[pos - 1U] < value) {
@@ -94,30 +94,26 @@ float SIG_Calculate_Vpp(const uint32_t *dma_buf, float linear_gain)
 		return 0.0f;
 	}
 
-	float32_t smallest[5] = { 1e9f, 1e9f, 1e9f, 1e9f, 1e9f };
-	float32_t largest[5] = { -1e9f, -1e9f, -1e9f, -1e9f, -1e9f };
+	// 先用 ADC 原始码值（12 位整数）做 Top-5 极值统计，避免循环内大量浮点除法。
+	int32_t smallest[5] = { 9999, 9999, 9999, 9999, 9999 };
+	int32_t largest[5] = { -1, -1, -1, -1, -1 };
 
 	for (uint32_t word_index = 0; word_index < ADC_DMA_WORDS; word_index++) {
-		// 双 ADC 采样值是打包在一个 32 位字里的，这里拆开后分别统计。
 		uint32_t packed = dma_buf[word_index];
-		uint16_t samples[2];
-		samples[0] = (uint16_t)(packed & 0xFFFFU) & 0x0FFFU;
-		samples[1] = (uint16_t)((packed >> 16U) & 0xFFFFU) & 0x0FFFU;
+		int32_t s0 = (int32_t)(packed & 0x0FFFU);
+		int32_t s1 = (int32_t)((packed >> 16U) & 0x0FFFU);
 
-		for (uint8_t i = 0; i < 2U; i++) {
-			float32_t voltage = (float32_t)samples[i] * 3.3f / 4096.0f;
-
-			if (voltage < smallest[4]) {
-				SIG_InsertAscending(smallest, 4U, voltage);
-			}
-			if (voltage > largest[4]) {
-				SIG_InsertDescending(largest, 4U, voltage);
-			}
-		}
+		if (s0 < smallest[4]) { SIG_InsertAscending_s32(smallest, 4U, s0); }
+		if (s0 > largest[4])  { SIG_InsertDescending_s32(largest, 4U, s0); }
+		if (s1 < smallest[4]) { SIG_InsertAscending_s32(smallest, 4U, s1); }
+		if (s1 > largest[4])  { SIG_InsertDescending_s32(largest, 4U, s1); }
 	}
 
+	// 只在最后把第 5 大 / 第 5 小的码值换算成电压，再做增益还原。
+	float32_t v_max = (float32_t)largest[4] * 3.3f / 4096.0f;
+	float32_t v_min = (float32_t)smallest[4] * 3.3f / 4096.0f;
 	float32_t gain = (linear_gain > 0.0f) ? linear_gain : 1.0f;
-	return (largest[4] - smallest[4]) / gain;
+	return (v_max - v_min) / gain;
 }
 
 int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg)
