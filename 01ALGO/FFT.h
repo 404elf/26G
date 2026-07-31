@@ -4,34 +4,34 @@
 #include "main.h"
 #include "arm_math.h"
 
-// FFT 长度固定为 4096 点，便于和当前采样帧对齐。
+// 4096 个实采样点对应 2048 个 DMA 双样本字。
 #define FFT_LENGTH      4096U
-// 实数 FFT 的有效幅值点数为 N/2。
+// 实数 FFT 只保留正频率半谱。
 #define FFT_BIN_COUNT   (FFT_LENGTH / 2U)
-// 采样率由前端采样链路决定，这里用于把 bin 换算成频率。
+// 三重 ADC 等效采样率；改定时器后记得同步这里。
 #define FFT_SAMPLE_RATE_HZ  7200000.0f
 #define FFT_BIN_WIDTH_HZ     (FFT_SAMPLE_RATE_HZ / (float32_t)FFT_LENGTH)
 
-// FFT 实例和缓冲区都放在全局，方便任务层直接调用。
+// FFT 实例与共享缓冲区。
 extern arm_rfft_fast_instance_f32 g_rfft_instance;
-// 加窗后的时域输入（供 FFT 使用），放在 CCM 中。
+// 加 Hann 窗后的 FFT 输入。
 extern float32_t rfft_input[FFT_LENGTH];
-// 去直流、未加窗的纯交流时域信号（供过零触发和波形显示使用）。
+// 去直流后的原始时域帧，供相位估计使用。
 extern float32_t rfft_time_domain[FFT_LENGTH];
-// CMSIS-DSP 输出的复数域临时缓冲。
+// CMSIS-DSP 复数输出暂存区。
 extern float32_t rfft_output_complex[FFT_LENGTH];
-// 每个频点的幅值谱，供基波和谐波搜索使用。
+// 正频率幅度谱。
 extern float32_t rfft_mag[FFT_BIN_COUNT];
 
-// 初始化 FFT 运行环境。
+// 初始化 FFT 并预生成窗函数。
 void FFT_Init(void);
-// 把 DMA 数据展开成时域信号，再做窗函数和 FFT。
+// 解包 DMA、去直流、加窗并执行 FFT。
 void FFT_Process_Unpack(const uint32_t *dma_buf, float linear_gain);
-// 对当前峰值附近做细化插值，得到更准确的频率和幅值。
+// 用 Rife 插值细化指定峰的频率和幅值。
 void FFT_Rife_Interpolate(int bin_center, float32_t *out_freq, float32_t *out_amp, float linear_gain);
-// 在指定 bin 范围内找幅值最大的点。
+// 返回指定范围内的最大幅值 bin。
 int FFT_Find_Max_Bin(const float32_t *mag, int start_bin, int end_bin);
-// 谐波搜索时使用的局部峰值搜索接口，便于语义区分。
+// 局部峰搜索接口，语义上用于谐波窗口。
 int FFT_Find_Local_Max_Bin(const float32_t *mag, int start_bin, int end_bin);
 
 #endif

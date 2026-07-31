@@ -3,21 +3,22 @@
 
 #include "main.h"
 
-// 根据频率对幅值做前端补偿，让不同频段的结果更接近真实值。
+// 按频率补偿前端幅频响应。
 float SIG_Apply_LUT_Compensation(float freq_Hz, float raw_amp);
-// 用谐波幅值估算总真有效值。
+// 由各正弦分量峰值计算总有效值。
 float SIG_Calculate_TrueRMS(const float *harmonic_amps, uint8_t count);
-// 从 DMA 数据中估算峰峰值，结果会结合前端增益做修正。
+// 剔除极端样本后计算峰峰值。
 float SIG_Calculate_Vpp(const uint32_t *dma_buf, float linear_gain);
-// 用简单迟滞阈值找到波形的起始零交点，便于重采样显示。
+// 查找带迟滞的上升过零点。
 int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg);
-// 把采样点重采样成适合屏幕显示的波形像素值。
-void SIG_CubicSpline_Resample(const float *in_pts, uint16_t in_len, uint16_t *out_pixels, uint16_t out_len);
-// 从浮点起点开始，按精确的采样跨度重采样；用于严格显示 1 个或 3 个周期。
-void SIG_CubicSpline_ResampleWindow(const float *in_pts,
-                                    uint16_t in_len,
-                                    float start_pos,
-                                    float span_samples,
+// 从原始帧估相位，再按谐波参数合成 1 或 3 个周期。
+uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
+                                    uint16_t sample_count,
+                                    float sample_rate_hz,
+                                    const float *component_freq_hz,
+                                    const float *component_amp,
+                                    uint8_t component_count,
+                                    uint8_t period_count,
                                     uint16_t *out_pixels,
                                     uint16_t out_len);
 

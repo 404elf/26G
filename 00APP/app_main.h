@@ -3,7 +3,7 @@
 
 #include "main.h"
 
-// 入口层只暴露最少的两个接口：初始化和主循环调度。
+// 应用层只暴露初始化和主循环调度接口。
 void app_init(void);
 void app_loop(void);
 

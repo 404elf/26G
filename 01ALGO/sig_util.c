@@ -5,7 +5,7 @@
 #include "FFT.h"
 #include "adc_measure.h"
 
-// 频率补偿 LUT：根据频率修正前端幅值衰减。
+// 10~500 kHz 幅值补偿表，每 10 kHz 一个点。
 #define SIG_LUT_POINTS 51U
 
 static const float32_t lut_freq_gain[SIG_LUT_POINTS] = {
@@ -28,8 +28,7 @@ static float32_t SIG_ClampFloat(float32_t value, float32_t min_value, float32_t 
 	return value;
 }
 
-// 有序插入一个新值，用来维护最小/最大样本集合。
-// 用整数版替代原来的 float 版，避免循环内反复做浮点运算。
+// 维护固定长度的极值队列，供抗毛刺 Vpp 统计使用。
 static void SIG_InsertAscending_s32(int32_t *sorted_values, uint8_t count, int32_t value)
 {
 	uint8_t pos = count;
@@ -52,7 +51,7 @@ static void SIG_InsertDescending_s32(int32_t *sorted_values, uint8_t count, int3
 
 float SIG_Apply_LUT_Compensation(float freq_Hz, float raw_amp)
 {
-    // 低频和高频直接落到 LUT 两端，中间做线性插值。
+    // 超出表范围时钳位，中间线性插值。
 	if (freq_Hz <= 10000.0f) {
 		return raw_amp * lut_freq_gain[0];
 	}
@@ -82,7 +81,7 @@ float SIG_Calculate_TrueRMS(const float *harmonic_amps, uint8_t count)
 
 	float32_t sum = 0.0f;
 	for (uint8_t i = 0; i < count; i++) {
-		// (Vp / √2)? = Vp? / 2，用乘法代替除法更快。
+		// 输入是峰值，不是 RMS；每项功率为 Vp*Vp/2。
 		sum += harmonic_amps[i] * harmonic_amps[i] * 0.5f;
 	}
 	return sqrtf(sum);
@@ -94,7 +93,7 @@ float SIG_Calculate_Vpp(const uint32_t *dma_buf, float linear_gain)
 		return 0.0f;
 	}
 
-	// Top-5 极值统计：剔除偶发毛刺，用第 5 大减第 5 小算 Vpp。
+	// 丢掉两端各 4 个毛刺，用第 5 大减第 5 小。
 	int32_t smallest[5] = { 9999, 9999, 9999, 9999, 9999 };
 	int32_t largest[5] = { -1, -1, -1, -1, -1 };
 
@@ -122,7 +121,7 @@ int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg)
 	}
 
 	const float32_t v_hyst = 0.02f;
-	// 用迟滞条件找上升沿零交点，避免噪声导致误触发。
+	// 20 mV 迟滞，避免零点附近来回触发。
 	for (uint32_t index = 0; index + 1U < FFT_LENGTH; index++) {
 		float32_t current = unpacked_v[index];
 		float32_t next = unpacked_v[index + 1U];
@@ -133,135 +132,106 @@ int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg)
 	return -1;
 }
 
-static float32_t SIG_CubicSampleAt(const float *in_pts, uint16_t in_len, float32_t source_pos)
-{
-	if (source_pos < 0.0f) {
-		source_pos = 0.0f;
-	}
-
-	float32_t max_pos = (float32_t)(in_len - 1U);
-	if (source_pos > max_pos) {
-		source_pos = max_pos;
-	}
-
-	int i1 = (int)source_pos;
-	int i0 = (i1 > 0) ? (i1 - 1) : 0;
-	int i2 = (i1 + 1 < (int)in_len) ? (i1 + 1) : (int)in_len - 1;
-	int i3 = (i1 + 2 < (int)in_len) ? (i1 + 2) : (int)in_len - 1;
-
-	float32_t t = source_pos - (float32_t)i1;
-	float32_t t2 = t * t;
-	float32_t t3 = t2 * t;
-
-	float32_t p0 = in_pts[i0];
-	float32_t p1 = in_pts[i1];
-	float32_t p2 = in_pts[i2];
-	float32_t p3 = in_pts[i3];
-
-	return 0.5f * ((2.0f * p1) +
-	               (-p0 + p2) * t +
-	               (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
-	               (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
-}
-
-void SIG_CubicSpline_Resample(const float *in_pts, uint16_t in_len, uint16_t *out_pixels, uint16_t out_len)
-{
-	if (in_pts == NULL || out_pixels == NULL || in_len < 2U || out_len == 0U) {
-		return;
-	}
-
-	// 1. 寻找当前波形段的极值
-	float32_t min_value = in_pts[0];
-	float32_t max_value = in_pts[0];
-	for (uint16_t i = 1; i < in_len; i++) {
-		if (in_pts[i] < min_value) {
-			min_value = in_pts[i];
-		}
-		if (in_pts[i] > max_value) {
-			max_value = in_pts[i];
-		}
-	}
-
-	float32_t range = max_value - min_value;
-	if (range < 1e-6f) {
-		for (uint16_t i = 0; i < out_len; i++) {
-			out_pixels[i] = 120U;
-		}
-		return;
-	}
-
-	// 2. Catmull-Rom 四点样条插值：高频波峰圆滑无折角
-	for (uint16_t out_index = 0; out_index < out_len; out_index++) {
-		float32_t source_pos;
-		if (out_len == 1U) {
-			source_pos = 0.0f;
-		} else {
-			source_pos = ((float32_t)out_index * (float32_t)(in_len - 1U)) / (float32_t)(out_len - 1U);
-		}
-
-		float32_t interpolated = SIG_CubicSampleAt(in_pts, in_len, source_pos);
-
-		// 3. 归一化并映射到 20~220 像素区间（留上下边距，避免贴屏边）
-		float32_t normalized = (interpolated - min_value) / range;
-		normalized = SIG_ClampFloat(normalized, 0.0f, 1.0f);
-		float32_t pixel = 220.0f - normalized * 200.0f;
-		out_pixels[out_index] = (uint16_t)(pixel + 0.5f);
-	}
-}
-
-void SIG_CubicSpline_ResampleWindow(const float *in_pts,
-                                    uint16_t in_len,
-                                    float start_pos,
-                                    float span_samples,
+uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
+                                    uint16_t sample_count,
+                                    float sample_rate_hz,
+                                    const float *component_freq_hz,
+                                    const float *component_amp,
+                                    uint8_t component_count,
+                                    uint8_t period_count,
                                     uint16_t *out_pixels,
                                     uint16_t out_len)
 {
-	if (in_pts == NULL || out_pixels == NULL || in_len < 2U || out_len == 0U || span_samples < 0.0f) {
-		return;
-	}
+    const float32_t two_pi = 6.28318530717958647692f;
+    float32_t raw_phase[4] = { 0.0f };
+    float32_t relative_phase[4] = { 0.0f };
 
-	float32_t max_pos = (float32_t)(in_len - 1U);
-	start_pos = SIG_ClampFloat(start_pos, 0.0f, max_pos);
-	if (start_pos + span_samples > max_pos) {
-		span_samples = max_pos - start_pos;
-	}
+    if (time_domain == NULL || component_freq_hz == NULL || component_amp == NULL ||
+        out_pixels == NULL || sample_count < 2U || out_len == 0U ||
+        component_count == 0U || component_count > 4U ||
+        sample_rate_hz <= 0.0f || component_freq_hz[0] <= 0.0f) {
+        return 0U;
+    }
 
-	float32_t min_value = 0.0f;
-	float32_t max_value = 0.0f;
-	for (uint16_t out_index = 0; out_index < out_len; out_index++) {
-		float32_t fraction = (out_len == 1U)
-		                   ? 0.0f
-		                   : (float32_t)out_index / (float32_t)(out_len - 1U);
-		float32_t source_pos = start_pos + fraction * span_samples;
-		float32_t interpolated = SIG_CubicSampleAt(in_pts, in_len, source_pos);
+    // Hann 加权正交投影只估相位；显示点不再直接复用带噪 ADC 样本。
+    float32_t window_step = two_pi / (float32_t)(sample_count - 1U);
+    float32_t window_step_cos = arm_cos_f32(window_step);
+    float32_t window_step_sin = arm_sin_f32(window_step);
 
-		if (out_index == 0U || interpolated < min_value) {
-			min_value = interpolated;
-		}
-		if (out_index == 0U || interpolated > max_value) {
-			max_value = interpolated;
-		}
-	}
+    for (uint8_t component = 0U; component < component_count; component++) {
+        float32_t omega = two_pi * component_freq_hz[component] / sample_rate_hz;
+        float32_t step_cos = arm_cos_f32(omega);
+        float32_t step_sin = arm_sin_f32(omega);
+        float32_t osc_cos = 1.0f;
+        float32_t osc_sin = 0.0f;
+        float32_t window_cos = 1.0f;
+        float32_t window_sin = 0.0f;
+        float32_t in_phase = 0.0f;
+        float32_t quadrature = 0.0f;
 
-	float32_t range = max_value - min_value;
-	if (range < 1e-6f) {
-		for (uint16_t out_index = 0; out_index < out_len; out_index++) {
-			out_pixels[out_index] = 120U;
-		}
-		return;
-	}
+        for (uint16_t sample = 0U; sample < sample_count; sample++) {
+            float32_t window = 0.5f * (1.0f - window_cos);
+            float32_t weighted = time_domain[sample] * window;
+            in_phase += weighted * osc_cos;
+            quadrature += weighted * osc_sin;
 
-	for (uint16_t out_index = 0; out_index < out_len; out_index++) {
-		float32_t fraction = (out_len == 1U)
-		                   ? 0.0f
-		                   : (float32_t)out_index / (float32_t)(out_len - 1U);
-		float32_t source_pos = start_pos + fraction * span_samples;
-		float32_t interpolated = SIG_CubicSampleAt(in_pts, in_len, source_pos);
-		float32_t normalized = (interpolated - min_value) / range;
-		normalized = SIG_ClampFloat(normalized, 0.0f, 1.0f);
-		float32_t pixel = 220.0f - normalized * 200.0f;
-		out_pixels[out_index] = (uint16_t)(pixel + 0.5f);
-	}
+            float32_t next_osc_cos = osc_cos * step_cos - osc_sin * step_sin;
+            osc_sin = osc_sin * step_cos + osc_cos * step_sin;
+            osc_cos = next_osc_cos;
+
+            float32_t next_window_cos = window_cos * window_step_cos - window_sin * window_step_sin;
+            window_sin = window_sin * window_step_cos + window_cos * window_step_sin;
+            window_cos = next_window_cos;
+        }
+
+        // 对 x=A·cos(ωt+φ)，I/Q 对应 A·cosφ 与 -A·sinφ。
+        raw_phase[component] = atan2f(-quadrature, in_phase);
+    }
+
+    // 消掉任意帧起点，只保留各谐波相对基波的相位。
+    relative_phase[0] = 0.0f;
+    for (uint8_t component = 1U; component < component_count; component++) {
+        uint32_t order = (uint32_t)(component_freq_hz[component] / component_freq_hz[0] + 0.5f);
+        if (order < 2U) {
+            return 0U;
+        }
+        float32_t phase = raw_phase[component] - (float32_t)order * raw_phase[0];
+        while (phase > 3.14159265358979323846f) { phase -= two_pi; }
+        while (phase < -3.14159265358979323846f) { phase += two_pi; }
+        relative_phase[component] = phase;
+    }
+
+    uint8_t periods = (period_count == 3U) ? 3U : 1U;
+    float32_t max_abs = 0.0f;
+    for (uint16_t out_index = 0U; out_index < out_len; out_index++) {
+        float32_t fraction = (out_len == 1U) ? 0.0f : (float32_t)out_index / (float32_t)(out_len - 1U);
+        float32_t base_angle = two_pi * (float32_t)periods * fraction;
+        float32_t value = 0.0f;
+        for (uint8_t component = 0U; component < component_count; component++) {
+            uint32_t order = (uint32_t)(component_freq_hz[component] / component_freq_hz[0] + 0.5f);
+            value += component_amp[component] * arm_cos_f32((float32_t)order * base_angle + relative_phase[component]);
+        }
+        float32_t abs_value = fabsf(value);
+        if (abs_value > max_abs) { max_abs = abs_value; }
+    }
+
+    if (max_abs < 1e-6f) {
+        for (uint16_t out_index = 0U; out_index < out_len; out_index++) { out_pixels[out_index] = 120U; }
+        return 1U;
+    }
+
+    for (uint16_t out_index = 0U; out_index < out_len; out_index++) {
+        float32_t fraction = (out_len == 1U) ? 0.0f : (float32_t)out_index / (float32_t)(out_len - 1U);
+        float32_t base_angle = two_pi * (float32_t)periods * fraction;
+        float32_t value = 0.0f;
+        for (uint8_t component = 0U; component < component_count; component++) {
+            uint32_t order = (uint32_t)(component_freq_hz[component] / component_freq_hz[0] + 0.5f);
+            value += component_amp[component] * arm_cos_f32((float32_t)order * base_angle + relative_phase[component]);
+        }
+        float32_t pixel = 120.0f - (value / max_abs) * 100.0f;
+        pixel = SIG_ClampFloat(pixel, 20.0f, 220.0f);
+        out_pixels[out_index] = (uint16_t)(pixel + 0.5f);
+    }
+
+    return 1U;
 }
-
-

@@ -7,16 +7,16 @@
 
 #include "sig_util.h"
 
-// 原始 DMA 缓冲区放在 IRAM2，便于和主内存分离。
+// DMA 写 IRAM2；任务只在完整帧交付后读取。
 uint32_t adc_dma_buf[ADC_DMA_WORDS] __attribute__((section(".iram2")));
-// FullCplt 时从 DMA 区拷贝到此处（IRAM1），任务层安全读取。
+// 兼容旧方案的安全帧缓冲区，当前流程未使用。
 uint32_t adc_safe_buf[ADC_DMA_WORDS] __attribute__((section(".iram1")));
 
-// ISR 与任务层共享的帧状态。
+// ISR 与任务共享，修改顺序要配合内存屏障。
 volatile uint8_t adc_buffer_ready = 0U;
 volatile ADC_MeasureState_t adc_measure_state = ADC_MEASURE_STATE_IDLE;
 
-// 启动、完成和超时诊断。
+// 现场诊断计数与寄存器快照。
 volatile uint8_t adc_last_start_stage = 0U;
 volatile HAL_StatusTypeDef adc_last_hal_status = HAL_OK;
 volatile uint32_t adc_start_count = 0U;
@@ -51,7 +51,7 @@ static void ADC_Measure_CaptureRegisters(void)
     adc_last_tim8_cr1 = htim8.Instance->CR1;
 }
 
-// 仅冻结硬件，不调用会操作 HAL Lock/State 的函数；可安全用于 DMA 完成回调。
+// 回调里只冻结寄存器，别调用会改 HAL Lock/State 的停止函数。
 static void ADC_Measure_FreezeHardware(void)
 {
     CLEAR_BIT(htim8.Instance->CR1, TIM_CR1_CEN);
@@ -62,7 +62,7 @@ static void ADC_Measure_FreezeHardware(void)
     __HAL_ADC_DISABLE_IT(&hadc1, ADC_IT_OVR);
 }
 
-// 仅在任务上下文调用：让 HAL 句柄状态与已经停止的硬件保持一致。
+// 只在任务上下文同步 HAL 句柄状态。
 static void ADC_Measure_SyncStoppedHandles(void)
 {
     (void)HAL_TIM_Base_Stop(&htim8);
@@ -79,7 +79,7 @@ static HAL_StatusTypeDef ADC_Measure_ResetMultimodeSequencer(void)
     ADC_Common_TypeDef *common = ADC_COMMON_REGISTER(&hadc1);
     ADC_MultiModeTypeDef multimode;
 
-    // RM0090：交错序列被 DMA 传输结束打断后，必须先回到独立模式再重编程交错模式。
+    // 关键：Normal DMA 结束后先退回独立模式，再重设三重交错。
     CLEAR_BIT(common->CCR, ADC_CCR_MULTI | ADC_CCR_DMA);
     __DSB();
 
@@ -127,7 +127,7 @@ HAL_StatusTypeDef ADC_Measure_Start(void)
         return HAL_ERROR;
     }
 
-    // 正常帧到这里应已经是 READY；只有检测到上一次异常残留时才执行恢复。
+    // 正常路径应为 READY；这里只清理上一帧的异常残留。
     if (((hadc1.Instance->CR2 & ADC_CR2_ADON) != RESET) ||
         ((hadc2.Instance->CR2 & ADC_CR2_ADON) != RESET) ||
         ((hadc3.Instance->CR2 & ADC_CR2_ADON) != RESET)) {
@@ -163,7 +163,7 @@ HAL_StatusTypeDef ADC_Measure_Start(void)
         return status;
     }
 
-    // 三重交替模式：先启动 ADC2、ADC3，再装载主 ADC1 的 DMA Normal 帧。
+    // 顺序不能换：先 ADC2/ADC3，再启动 ADC1 的 Normal DMA。
     status = HAL_ADC_Start(&hadc2);
     if (status != HAL_OK) {
         ADC_Measure_RecordStartFailure(3U, status);
@@ -183,7 +183,7 @@ HAL_StatusTypeDef ADC_Measure_Start(void)
         return status;
     }
 
-    // 记录装载后的寄存器现场，但不再用瞬时 EN/NDTR 值阻断本帧。
+    // 快照仅供调试，别用瞬时 EN/NDTR 判断本帧成败。
     ADC_Measure_CaptureRegisters();
     adc_measure_state = ADC_MEASURE_STATE_SAMPLING;
     status = HAL_TIM_Base_Start(&htim8);
@@ -240,7 +240,7 @@ void ADC_Measure_Stop(void)
 
 void ADC_Cal_Vpp(uint16_t *pBuffer, uint16_t length, uint8_t ping_pong_index)
 {
-    // 旧接口保留，当前主要用于兼容老调用点。
+    // 旧接口只为兼容；结果不参与当前测量链路。
     static uint16_t global_max = 0;
     static uint16_t global_min = 4095;
 
@@ -261,18 +261,18 @@ void ADC_Cal_Vpp(uint16_t *pBuffer, uint16_t length, uint8_t ping_pong_index)
 
 float Get_Vpp(void)
 {
-    // 使用统一的 DMA 缓冲和增益信息来计算峰峰值。
+    // 当前工程固定为单位增益。
     return SIG_Calculate_Vpp(adc_dma_buf, 1.0f);
 }
 
 void Measure_ADC_HalfCpltCallback(void)
 {
-    // 单次触发模式下不使用半回调，保留接口兼容。
+    // Normal 单帧模式忽略半完成事件。
 }
 
 void Measure_ADC_FullCpltCallback(void)
 {
-    // DMA IRQ 已经把 Normal 流置回 READY；这里只快速冻结硬件并交付稳定的一帧。
+    // DMA 已回到 READY；冻结硬件后再置帧就绪标志。
     ADC_Measure_FreezeHardware();
     adc_last_dma_ndtr = hadc1.DMA_Handle->Instance->NDTR;
     adc_full_callback_count++;

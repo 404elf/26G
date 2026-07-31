@@ -1,7 +1,7 @@
 #include "app_main.h"
 #include "tasks.h"
 
-// 由各功能模块提供，入口层只负责调用。
+// 入口层只做调度，具体实现放在各功能模块。
 void ADC_Measure_Init(void);
 void Measure_ADC_HalfCpltCallback(void);
 void Measure_ADC_FullCpltCallback(void);
@@ -10,7 +10,7 @@ void FFT_Init(void);
 
 void app_init(void)
 {
-    // 只初始化，不启动采样——由 Task_Signal_Processing 统一管理 Start → Wait → Stop 周期。
+    // 这里只初始化；采样启停统一由信号处理任务管理。
     ADC_Measure_Init();
     FFT_Init();
 
@@ -19,7 +19,7 @@ void app_init(void)
 
 void app_loop(void)
 {
-    // 主循环只做节流调度，避免一直占用 CPU。
+    // 10 ms 调度一次，别在主循环里空转占满 CPU。
     static uint32_t last_tick = 0;
     uint32_t now = HAL_GetTick();
 
@@ -33,13 +33,13 @@ void app_loop(void)
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    // 预留外部中断入口，后续按键或控制信号可以接到这里。
+    // 外部按键或控制信号可从这里接入。
     (void)GPIO_Pin;
 }
 
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    // 只接收 ADC1 的回调，表示一组 DMA 数据已经准备好一半。
+    // 三重 ADC 由 ADC1 作为主 ADC，只接收它的 DMA 回调。
     if (hadc->Instance == ADC1) {
         Measure_ADC_HalfCpltCallback();
     }
@@ -47,7 +47,7 @@ void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    // 只接收 ADC1 的回调，表示这一帧采样数据已经完整。
+    // ADC1 全完成回调表示整帧采样结束。
     if (hadc->Instance == ADC1) {
         Measure_ADC_FullCpltCallback();
     }
@@ -55,20 +55,20 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
 void HAL_DACEx_ConvHalfCpltCallbackCh2(DAC_HandleTypeDef *hdac)
 {
-    // 当前未使用 DAC 中断回调，保留接口避免后续移植出错。
+    // DAC 暂未使用，保留 HAL 回调接口。
     (void)hdac;
 }
 
 void HAL_DACEx_ConvCpltCallbackCh2(DAC_HandleTypeDef *hdac)
 {
-    // 当前未使用 DAC 中断回调，保留接口避免后续移植出错。
+    // DAC 暂未使用，保留 HAL 回调接口。
     (void)hdac;
 }
-/* 重写错误回调函数 (取消 __weak) */
+// 覆盖 HAL 的弱错误回调，便于现场断点定位。
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ADC1) {
-        // 在这里打断点！如果停到了这里，说明 DMA 或 ADC 硬件报了 Error
+        // 调试提示：停在这里说明 ADC 或 DMA 报错。
         __NOP(); 
     }
 }

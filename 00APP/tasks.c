@@ -10,8 +10,7 @@
 #include "sig_util.h"
 #include "usart.h"
 
-// 调试阶段设为 1：主循环每次都自动请求一帧，方便在监视窗口连续观察数据。
-// 串口屏接入后改为 0：恢复为仅收到 W1/W3 时刷新一次静态帧。
+// 联调时才改为 1；交付前保持 0，避免屏幕被连续刷新。
 #define TASK_DEBUG_AUTO_REFRESH 0
 #define TASK_DEBUG_FIREWATER_OUTPUT 0
 
@@ -23,10 +22,10 @@
 #define HMI_VIEW_WAVEFORM 0U
 #define HMI_VIEW_SPECTRUM 1U
 
-// 屏幕显示数据放在 IRAM1，减少和 DMA/FFT 缓冲区的冲突。
+// 显示帧放 IRAM1，避开 DMA 与 FFT 热区。
 SerialScreenData_t g_screen_data __attribute__((section(".iram1")));
 
-// 保命参数：采样等待超时和谐波噪声门限。
+// 测量边界与抗噪门限，单位见变量名。
 static const uint32_t TASK_SAMPLE_TIMEOUT_MS = 10U;
 static const float32_t TASK_HARMONIC_NOISE_FLOOR_V = 0.002f;
 static const float32_t TASK_BASE_MIN_AMP_V = 0.003f;
@@ -45,16 +44,16 @@ typedef struct {
 	float32_t amp_v;
 } Task_SpectralCandidate_t;
 
-// 屏幕只发布完整成功的一帧；处理中途失败时继续保留上一帧。
+// 工作帧成功后才发布，失败时保留上一帧。
 static SerialScreenData_t g_working_screen_data __attribute__((section(".iram1")));
 
-// 未来可由串口接收中断写入。主循环只在 pending=1 时采样一次。
+// 中断只置请求，主循环看到 pending 后处理一次。
 static volatile uint8_t g_wave_refresh_pending = 0U;
 static volatile uint8_t g_requested_wave_mode = 1U;
 static volatile uint8_t g_requested_view = HMI_VIEW_WAVEFORM;
 static uint8_t g_render_view = HMI_VIEW_WAVEFORM;
 
-// 串口命令缓冲：用于识别简单控制指令，例如波形显示模式切换。
+// 短命令采用滑动缓冲，兼容 W1/W3/T1/T3。
 static char g_serial_cmd_buffer[12];
 static uint8_t g_serial_cmd_length = 0;
 static uint8_t g_hmi_rx_byte = 0U;
@@ -82,8 +81,7 @@ static void Task_UpdateSpectrumBars(SerialScreenData_t *data, uint8_t harmonic_c
 		return;
 	}
 
-	// 这里把“第几个谐波 + 它有多强”转成屏幕上要画的柱子位置和高度。
-	// X 坐标表示第几个谐波，Y 坐标表示柱子的高度。
+	// 将分量序号和幅值换成柱状图坐标。
 	for (uint8_t i = 0; i < 4U; i++) {
 		if (i < harmonic_count) {
 			data->spec_bar_x[i] = (uint16_t)(24U + (uint16_t)i * 28U);
@@ -104,8 +102,7 @@ static void Task_UpdateSpectrumBars(SerialScreenData_t *data, uint8_t harmonic_c
 
 static uint8_t Task_IsAboveNoiseFloor(float32_t peak_mag, float32_t linear_gain)
 {
-	// 这一步是“防误判”的保险丝：先估算这个峰大约有多大，再决定它是不是有效谐波。
-	// 如果算出来的幅值太小，就直接认为它只是噪声，不继续做精细插值。
+	// 先做廉价幅值门限，噪声峰不进入 Rife 插值。
 	float32_t gain = (linear_gain > 0.0f) ? linear_gain : 1.0f;
 	float32_t estimated_amp = (peak_mag / (float32_t)FFT_BIN_COUNT) * 2.0f / gain;
 	return (estimated_amp >= TASK_HARMONIC_NOISE_FLOOR_V) ? 1U : 0U;
@@ -127,7 +124,7 @@ static void Task_InsertSpectralCandidate(Task_SpectralCandidate_t *candidates,
 		return;
 	}
 
-	// 同一个主瓣可能在邻近搜索中被重复细化到同一条谱线，只保留幅值更大的记录。
+	// 相邻搜索可能命中同一主瓣，只留较强记录。
 	for (uint8_t i = 0U; i < *candidate_count; i++) {
 		if (fabsf(candidates[i].freq_hz - candidate.freq_hz) < (0.5f * TASK_FREQ_GRID_HZ)) {
 			if (candidate.amp_v > candidates[i].amp_v) {
@@ -172,8 +169,7 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 	Task_SpectralCandidate_t candidates[TASK_SPECTRAL_CANDIDATE_MAX];
 	uint8_t candidate_count = 0U;
 
-	// 搜索范围比题设边界各放宽半个500 Hz网格，避免Rife插值的微小抖动
-	// 把恰好10 kHz或500 kHz的有效谱线挡在门外。
+	// 边界放宽半格，10 kHz 和 500 kHz 不能被抖动挡掉。
 	int start_bin = (int)floorf(
 	    (TASK_BASE_MIN_FREQ_HZ - TASK_FREQ_EDGE_TOLERANCE_HZ) / FFT_BIN_WIDTH_HZ);
 	int end_bin = (int)ceilf(
@@ -222,7 +218,7 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 	int best_index = -1;
 	uint8_t best_match_count = 0U;
 	for (uint8_t i = 0U; i < candidate_count; i++) {
-		// 250~500 kHz的谱线只允许作为谐波参与匹配，不能被选成题设基波。
+		// 250~500 kHz 只能作谐波，不能作题设基波。
 		if (candidates[i].freq_hz < TASK_BASE_MIN_FREQ_HZ ||
 		    candidates[i].freq_hz > TASK_BASE_MAX_FREQ_HZ) {
 			continue;
@@ -260,7 +256,7 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 		}
 	}
 
-	// 题目信号至少含一个谐波；若本帧不能形成谐波族，则不发布错误基波。
+	// 没有“基波 + 谐波”关系就拒绝本帧，别拿干扰峰当基波。
 	if (best_index < 0 || best_match_count < 2U) {
 		return -1;
 	}
@@ -284,7 +280,7 @@ void Task_Signal_Processing(void)
 {
 	static uint32_t frame_cnt = 0;
 #if TASK_DEBUG_AUTO_REFRESH
-	// 只补充刷新请求，不覆盖 requested_wave_mode；以后即使接入 W3，自动调试也能保持三周期模式。
+	// 调试刷新不改周期模式。
 	g_wave_refresh_pending = 1U;
 #endif
 	if (g_wave_refresh_pending == 0U) {
@@ -297,16 +293,16 @@ void Task_Signal_Processing(void)
 	                       : HMI_VIEW_WAVEFORM;
 	g_wave_refresh_pending = 0U;
 
-	// ===== 第一段：准备采样 =====
+	// 采样
 	const float gain_snapshot = 1.0f;
 
-	// 单次触发 DMA。启动步骤失败时直接保留诊断现场，不进入无意义的等待。
+	// 启动失败就退出，保留驱动层诊断现场。
 	if (ADC_Measure_Start() != HAL_OK) {
 		ADC_Measure_Stop();
 		return;
 	}
 
-	// ===== 第二段：等待 DMA 完成 =====
+	// 等待完整 DMA 帧
 	uint32_t wait_start = HAL_GetTick();
 	while ((adc_buffer_ready == 0U) && ((HAL_GetTick() - wait_start) < TASK_SAMPLE_TIMEOUT_MS)) {
 	}
@@ -315,26 +311,24 @@ void Task_Signal_Processing(void)
 		return;
 	}
 
-	// DMA 回调已经冻结硬件；这里只同步 HAL 句柄并取得这一帧的独占处理权。
+	// 回调已冻结硬件；此处只取得帧处理权。
 	if (ADC_Measure_TakeFrame() != HAL_OK) {
 		ADC_Measure_Stop();
 		return;
 	}
 
-	// ===== 第三段：做频域分析 =====
-	// DMA 已完成，直接处理 adc_dma_buf。
+	// 频域分析
 	FFT_Process_Unpack(adc_dma_buf, gain_snapshot);
 
-	// 搜集有效谱线，并选择能解释其他谱线的最低谐波族成员作为基波。
+	// 选择能解释其他谱线的最低谐波族成员作为基波。
 	int k_base = Task_FindFundamentalBin(gain_snapshot);
 	if (k_base < 1) {
-		// 本帧不能形成可信的“基波 + 谐波族”，保留屏幕上的上一帧。
+		// 本帧不可信，屏幕继续保留上一帧。
 		ADC_Measure_ReleaseFrame();
 		return;
 	}
 
-	// 用 Rife 插值把基波频率和幅值再细化一下。
-	// 这样比直接拿整 bin 的峰值更准确。
+	// 整 bin 只负责定位，最终频率和幅值由 Rife 细化。
 	float32_t f1_measured = 0.0f;
 	float32_t A1 = 0.0f;
 	FFT_Rife_Interpolate(k_base, &f1_measured, &A1, gain_snapshot);
@@ -343,110 +337,99 @@ void Task_Signal_Processing(void)
 		ADC_Measure_ReleaseFrame();
 		return;
 	}
-	// 幅值补偿暂关：先用未经 LUT 修正的结果做验证。
+	// 幅值补偿暂关；启用时基波和谐波必须一起开。
 	// A1 = SIG_Apply_LUT_Compensation(f1, A1);
 
-	// ===== 第四段：组织显示用的基础结果 =====
-	// 所有结果先写工作缓存，成功后才整体发布，失败不破坏上一帧。
+	// 先写工作帧，全部成功后再发布。
 	Task_ResetScreenData(&g_working_screen_data, requested_wave_mode);
 	g_working_screen_data.f1_base_freq = f1;
 	g_working_screen_data.harmonic_count = 1U;
 	g_working_screen_data.harmonic_freq[0] = f1 / 1000.0f;
 	g_working_screen_data.harmonic_amp[0] = A1 * 1000.0f;
 
-	// ===== 第五段：搜索谐波（动态遍历，无硬编码限制） =====
-	// 按 2f1, 3f1, 4f1, 5f1, ... 逐个找谐波。
-	// 终止条件两个：
-	//   1. f_target > 500kHz — 超出题目规定范围
-	//   2. 已找满 2 个谐波（题目明确最多 2 个谐波分量）
-	// 先局部寻峰，再做噪声门限判断，最后才做精细插值。
+	// 逐次搜索 n·f1，最多记录两个谐波且不超过 500 kHz。
 	uint8_t h_count = 1U;
 	for (uint8_t harmonic = 2U; ; harmonic++) {
-		// 终止条件一：已找满 2 个谐波（基波+谐波≥3），直接退出。
+		// 基波加两个谐波已满足题目上限。
 		if (h_count >= 3U) {
 			break;
 		}
 
-		// 对外发布的谐波频率必须严格等于吸附后基波的整数倍。
+		// 对外频率必须是吸附后基波的整数倍。
 		float32_t f_target = f1 * (float32_t)harmonic;
 
-		// 终止条件二：超出题目规定的 500kHz 上限，不再继续搜索。
+		// 后续次数只会更高，越过 500 kHz 即可结束。
 		if (f_target > TASK_COMPONENT_MAX_FREQ_HZ) {
 			break;
 		}
 
-		// 搜峰中心使用未经500 Hz吸附的实测基波，避免谐波次数较高时累积网格误差。
+		// 找峰用实测 f1，别用吸附值累积高次网格误差。
 		float32_t f_target_measured = f1_measured * (float32_t)harmonic;
 		int bin_target = (int)(f_target_measured / FFT_BIN_WIDTH_HZ + 0.5f);
 		int k_h = FFT_Find_Local_Max_Bin(rfft_mag, bin_target - 2, bin_target + 2);
 		if (k_h < 1) {
-			// 这附近根本没有像样的峰，说明该次谐波不存在或太弱。
+			// 目标附近没有峰，继续检查下一次谐波。
 			continue;
 		}
 
-		// 先做噪声门限判断，避免把底噪当谐波。
+		// 先挡底噪，再做插值。
 		if (!Task_IsAboveNoiseFloor(rfft_mag[k_h], gain_snapshot)) {
-			// 峰太小就直接忽略，不再做 Rife 拟合。
+			// 太弱，不拟合。
 			continue;
 		}
 
-		// 通过门限后，再用 Rife 算出更准确的谐波频率和幅值。
+		// 通过门限后再细化频率与幅值。
 		float32_t fh = 0.0f;
 		float32_t Ah = 0.0f;
 		FFT_Rife_Interpolate(k_h, &fh, &Ah, gain_snapshot);
-		// 同样做一次补偿，保持各次谐波口径一致（暂关）。
+		// 与基波补偿保持同开同关。
 		// Ah = SIG_Apply_LUT_Compensation(fh, Ah);
 
-		// 附近的干扰或噪声峰不能冒充谐波：Rife细化后的频率必须仍贴近 n*f1。
+		// 细化后仍须贴近 n·f1，防止邻近干扰冒充谐波。
 		if (fabsf(fh - f_target_measured) > TASK_HARMONIC_FREQ_TOLERANCE_HZ) {
 			continue;
 		}
 
 		if (Ah * 1000.0f > 1.0f) {
-			// 频率按谐波定义发布为 n*f1；实测峰只负责确认该分量并估算幅值。
+			// 实测峰确认存在并给幅值；显示频率发布为 n·f1。
 			g_working_screen_data.harmonic_freq[h_count] = f_target / 1000.0f;
 			g_working_screen_data.harmonic_amp[h_count] = Ah * 1000.0f;
 			h_count++;
 		}
 	}
 
-	// ===== 第六段：计算时域指标 =====
-	// 谐波幅值已经有了，接下来把它们合成总 RMS。
-	// Vpp 则直接从原始 DMA 数据里统计最大最小值得到。
+	// 指标：RMS 由分量合成，Vpp 从原始 DMA 极值统计。
 	g_working_screen_data.harmonic_count = h_count;
 	g_working_screen_data.Vrms_val = SIG_Calculate_TrueRMS(g_working_screen_data.harmonic_amp, h_count);
 	g_working_screen_data.Vpp_val = SIG_Calculate_Vpp(adc_dma_buf, gain_snapshot) * 1000.0f;
 
-	// ===== 第七段：生成波形显示数据 =====
-	// 不再寻找零点。静态帧可从任意相位开始，只需保证横向跨度精确为 1/3 周期。
-	float32_t points_per_period = FFT_SAMPLE_RATE_HZ / f1;
-	float32_t period_count = (requested_wave_mode == 3U) ? 3.0f : 1.0f;
-	float32_t wave_span = period_count * points_per_period;
-	float32_t max_span = (float32_t)(FFT_LENGTH - 1U);
-	if (wave_span > max_span) {
-		wave_span = max_span;
+	// 用实测幅值和相对相位合成干净的显示波形。
+	float32_t component_freq_hz[4] = { 0.0f };
+	for (uint8_t component = 0U; component < h_count; component++) {
+		component_freq_hz[component] = g_working_screen_data.harmonic_freq[component] * 1000.0f;
 	}
-	float32_t wave_start = (max_span - wave_span) * 0.5f;
+	if (!SIG_ReconstructHarmonicWave(rfft_time_domain,
+	                                 FFT_LENGTH,
+	                                 FFT_SAMPLE_RATE_HZ,
+	                                 component_freq_hz,
+	                                 g_working_screen_data.harmonic_amp,
+	                                 h_count,
+	                                 requested_wave_mode,
+	                                 g_working_screen_data.wave_pixels,
+	                                 HMI_WAVE_SOURCE_POINTS)) {
+		ADC_Measure_ReleaseFrame();
+		return;
+	}
 
-	// 浮点起点 + 浮点跨度直接生成高密度显示点，避免整数截断和点数过少造成折线感。
-	SIG_CubicSpline_ResampleWindow(rfft_time_domain,
-	                               FFT_LENGTH,
-	                               wave_start,
-	                               wave_span,
-	                               g_working_screen_data.wave_pixels,
-	                               HMI_WAVE_SOURCE_POINTS);
-	// 柱状图则由谐波幅值直接生成。
+	// 频谱柱只表达已确认的分量。
 	Task_UpdateSpectrumBars(&g_working_screen_data, h_count);
 
-	// ===== 第八段：交给显示层 =====
-	// 只有完整成功的一帧才覆盖当前显示；不按键时该缓存保持不变。
+	// 到这里才提交；不按键或本帧失败都保持原画面。
 	g_screen_data = g_working_screen_data;
 	g_render_view = requested_view;
 	SerialScreen_Render_Task(&g_screen_data);
 
-	// ===== FireWater 协议输出 =====
-	// 格式：每行逗号分隔，换行触发 FireWater 绘图。
-	// 计数测试：:frame, … , f1_kHz, Vpp_V, Vrms_V
+	// FireWater 调试输出，交付版保持关闭。
 #if TASK_DEBUG_FIREWATER_OUTPUT
 	printf(":cnt,%lu,:f1,%.1f,:Vpp,%.3f,:Vrms,%.3f\n",
 	       (unsigned long)frame_cnt,
@@ -469,8 +452,7 @@ void SerialScreen_Render_Task(const SerialScreenData_t *data)
 		return;
 	}
 
-	// page0 当前页：n1=峰峰值(mV)，n2=有效值(mV)，n3=基频(Hz)。
-	// 数字控件只接受整数；当前三项本来就按 mV/Hz 显示，无需传浮点字符串。
+	// page0：n1=Vpp(mV)，n2=Vrms(mV)，n3=f1(Hz)；控件只收整数。
 	char command[40];
 	snprintf(command, sizeof(command), "n1.val=%lu",
 	         (unsigned long)(data->Vpp_val + 0.5f));
@@ -498,8 +480,7 @@ void SerialScreen_Init(void)
 
 void SerialScreen_Rx_Handler(uint8_t rx_byte)
 {
-	// addt 透传握手：0xFE 表示屏幕已准备接收原始曲线字节，
-	// 0xFD 表示指定数量的数据已经接收完成。
+	// addt 握手：0xFE 可发送原始字节，0xFD 表示屏幕收完。
 	if (rx_byte == 0xFEU) {
 		g_hmi_addt_ready = 1U;
 		return;
@@ -509,27 +490,27 @@ void SerialScreen_Rx_Handler(uint8_t rx_byte)
 		return;
 	}
 
-	// 串口命令是“边收边拼”的，方便识别类似 W1 / W3 这种简单控制指令。
+	// 边收边匹配短命令。
 	if (rx_byte == '\r' || rx_byte == '\n' || rx_byte == 0xFFU) {
-		// 一行命令结束，清空缓冲区，准备接收下一条。
+		// 分隔符只负责清空残留命令。
 		g_serial_cmd_length = 0U;
 		g_serial_cmd_buffer[0] = '\0';
 		return;
 	}
 
-	// 缓冲区没满就直接追加。
+	// 未满则追加。
 	if (g_serial_cmd_length < (sizeof(g_serial_cmd_buffer) - 1U)) {
 		g_serial_cmd_buffer[g_serial_cmd_length++] = (char)rx_byte;
 		g_serial_cmd_buffer[g_serial_cmd_length] = '\0';
 	} else {
-		// 满了就左移一位，保留最近收到的命令内容。
+		// 满后丢最旧字节，保留最近命令。
 		memmove(g_serial_cmd_buffer, &g_serial_cmd_buffer[1], sizeof(g_serial_cmd_buffer) - 2U);
 		g_serial_cmd_buffer[sizeof(g_serial_cmd_buffer) - 2U] = (char)rx_byte;
 		g_serial_cmd_buffer[sizeof(g_serial_cmd_buffer) - 1U] = '\0';
 		g_serial_cmd_length = (uint8_t)(sizeof(g_serial_cmd_buffer) - 1U);
 	}
 
-	// 收到 1 或 W1 / T1，就切到单周期显示。
+	// 1、W1、T1：刷新单周期。
 	if (rx_byte == '1' || strstr(g_serial_cmd_buffer, "W1") != NULL || strstr(g_serial_cmd_buffer, "T1") != NULL) {
 		Task_RequestWaveRefresh(1U);
 		g_serial_cmd_length = 0U;
@@ -537,7 +518,7 @@ void SerialScreen_Rx_Handler(uint8_t rx_byte)
 		return;
 	}
 
-	// 收到 3 或 W3 / T3，就切到三周期显示。
+	// 3、W3、T3：刷新三周期。
 	if (rx_byte == '3' || strstr(g_serial_cmd_buffer, "W3") != NULL || strstr(g_serial_cmd_buffer, "T3") != NULL) {
 		Task_RequestWaveRefresh(3U);
 		g_serial_cmd_length = 0U;
@@ -545,7 +526,7 @@ void SerialScreen_Rx_Handler(uint8_t rx_byte)
 		return;
 	}
 
-	// page1 的“刷新频谱”按钮发送 ASCII 'S'（0x53）。
+	// S：刷新频谱页。
 	if (rx_byte == 'S' || rx_byte == 's') {
 		Task_RequestSpectrumRefresh();
 		g_serial_cmd_length = 0U;
@@ -553,10 +534,7 @@ void SerialScreen_Rx_Handler(uint8_t rx_byte)
 	}
 }
 
-/*
- * printf 串口重定向（前提：CubeMX 中配好 USART1，hal_conf.h 中启用 HAL_UART_MODULE_ENABLED）
- * 配置完成后，printf / SerialScreen_Render_Task 均可直接发数据到串口助手。
- */
+// printf 走 USART1；别在采样时序敏感区大量打印。
 int fputc(int ch, FILE *f)
 {
 	(void)f;
@@ -564,14 +542,14 @@ int fputc(int ch, FILE *f)
 	return ch;
 }
 
-// ==================== 陶晶驰串口屏 ====================
+// 陶晶驰串口屏
 
 static void UART_SendByte(uint8_t byte)
 {
 	HAL_UART_Transmit(&huart1, &byte, 1, 0xFFFF);
 }
 
-// 发送指令到陶晶驰串口屏（ASCII 串 + 3 字节 0xFF 帧尾）
+// HMI 指令以三个 0xFF 结尾。
 static void HMISendString(const char *str)
 {
 	while (*str) {
@@ -588,8 +566,7 @@ static HAL_StatusTypeDef HMI_SendWaveform(const uint16_t *wave_pixels, uint16_t 
 		return HAL_ERROR;
 	}
 
-	// s0 横向宽度为 800 像素。把算法生成的高密度静态帧展开到 800 点，
-	// 既铺满整个曲线控件，也降低低源点数造成的折线感。
+	// s0 宽 800 像素；源点变化时这里仍负责重采样到 800 点。
 	for (uint16_t i = 0U; i < HMI_WAVE_TX_POINTS; i++) {
 		float32_t source_pos =
 		    ((float32_t)i * (float32_t)(source_count - 1U)) /
@@ -607,7 +584,7 @@ static HAL_StatusTypeDef HMI_SendWaveform(const uint16_t *wave_pixels, uint16_t 
 			pixel = 255.0f;
 		}
 
-		// wave_pixels 保存的是屏幕 Y 坐标（越小越高），曲线控件的数据值则越大越高。
+		// 注意方向相反：Y 坐标越小越高，曲线数据值越大越高。
 		g_hmi_wave_tx[i] = (uint8_t)(255.0f - pixel + 0.5f);
 	}
 
@@ -623,7 +600,7 @@ static HAL_StatusTypeDef HMI_SendSpectrum(const SerialScreenData_t *data)
 	char command[40];
 	float32_t max_amp = 0.0f;
 
-	// page1：n0~n2 显示各分量峰值(mV)，n3~n5 显示各分量频率(Hz)。
+	// page1：n0~n2 为峰值(mV)，n3~n5 为频率(Hz)。
 	for (uint8_t i = 0U; i < 3U; i++) {
 		float32_t amp_mv = (i < data->harmonic_count) ? data->harmonic_amp[i] : 0.0f;
 		float32_t freq_hz = (i < data->harmonic_count)
@@ -645,9 +622,7 @@ static HAL_StatusTypeDef HMI_SendSpectrum(const SerialScreenData_t *data)
 		}
 	}
 
-	// 曲线控件被用作离散线谱画布：有效横轴为 10~500 kHz，
-	// 两端各留少量空白，避免边界频率的谱线贴边后看不完整。
-	// 纵轴按本帧最大分量自动缩放，保证较小谐波也能清楚看见。
+	// 10~500 kHz 映射到留边后的横轴；纵轴按本帧最大分量归一化。
 	memset(g_hmi_wave_tx, 10, HMI_SPECTRUM_TX_POINTS);
 	if (max_amp > 0.0f) {
 		uint8_t component_count = (data->harmonic_count < 3U)
