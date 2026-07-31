@@ -1,8 +1,8 @@
 #include "app_main.h"
+#include "tasks.h"
 
 // 由各功能模块提供，入口层只负责调用。
 void ADC_Measure_Init(void);
-void Task_Signal_Processing(void);
 void Measure_ADC_HalfCpltCallback(void);
 void Measure_ADC_FullCpltCallback(void);
 void FFT_Init(void);
@@ -14,6 +14,7 @@ void app_init(void)
     ADC_Measure_Init();
     FFT_Init();
     VCA821_Init();
+    SerialScreen_Init();
 }
 
 void app_loop(void)

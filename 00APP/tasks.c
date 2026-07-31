@@ -8,10 +8,19 @@
 #include "VCA821.h"
 #include "adc_measure.h"
 #include "sig_util.h"
+#include "usart.h"
 
 // 调试阶段设为 1：主循环每次都自动请求一帧，方便在监视窗口连续观察数据。
 // 串口屏接入后改为 0：恢复为仅收到 W1/W3 时刷新一次静态帧。
-#define TASK_DEBUG_AUTO_REFRESH 1
+#define TASK_DEBUG_AUTO_REFRESH 0
+#define TASK_DEBUG_FIREWATER_OUTPUT 0
+
+#define HMI_WAVE_SOURCE_POINTS 120U
+#define HMI_WAVE_TX_POINTS 800U
+#define HMI_SPECTRUM_TX_POINTS 557U
+#define HMI_ADD_READY_TIMEOUT_MS 100U
+#define HMI_VIEW_WAVEFORM 0U
+#define HMI_VIEW_SPECTRUM 1U
 
 // 屏幕显示数据放在 IRAM1，减少和 DMA/FFT 缓冲区的冲突。
 SerialScreenData_t g_screen_data __attribute__((section(".iram1")));
@@ -38,10 +47,21 @@ static SerialScreenData_t g_working_screen_data __attribute__((section(".iram1")
 // 未来可由串口接收中断写入。主循环只在 pending=1 时采样一次。
 static volatile uint8_t g_wave_refresh_pending = 0U;
 static volatile uint8_t g_requested_wave_mode = 1U;
+static volatile uint8_t g_requested_view = HMI_VIEW_WAVEFORM;
+static uint8_t g_render_view = HMI_VIEW_WAVEFORM;
 
 // 串口命令缓冲：用于识别简单控制指令，例如波形显示模式切换。
 static char g_serial_cmd_buffer[12];
 static uint8_t g_serial_cmd_length = 0;
+static uint8_t g_hmi_rx_byte = 0U;
+static volatile uint8_t g_hmi_addt_ready = 0U;
+static volatile uint8_t g_hmi_addt_finished = 0U;
+static uint8_t g_hmi_wave_tx[HMI_WAVE_TX_POINTS] __attribute__((section(".iram1")));
+
+static void HMISendString(const char *str);
+static HAL_StatusTypeDef HMI_SendCurveBytes(uint16_t point_count);
+static HAL_StatusTypeDef HMI_SendWaveform(const uint16_t *wave_pixels, uint16_t source_count);
+static HAL_StatusTypeDef HMI_SendSpectrum(const SerialScreenData_t *data);
 
 static void Task_ResetScreenData(SerialScreenData_t *data, uint8_t wave_mode)
 {
@@ -230,6 +250,13 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 void Task_RequestWaveRefresh(uint8_t wave_mode)
 {
 	g_requested_wave_mode = (wave_mode == 3U) ? 3U : 1U;
+	g_requested_view = HMI_VIEW_WAVEFORM;
+	g_wave_refresh_pending = 1U;
+}
+
+void Task_RequestSpectrumRefresh(void)
+{
+	g_requested_view = HMI_VIEW_SPECTRUM;
 	g_wave_refresh_pending = 1U;
 }
 
@@ -245,6 +272,9 @@ void Task_Signal_Processing(void)
 	}
 
 	uint8_t requested_wave_mode = (g_requested_wave_mode == 3U) ? 3U : 1U;
+	uint8_t requested_view = (g_requested_view == HMI_VIEW_SPECTRUM)
+	                       ? HMI_VIEW_SPECTRUM
+	                       : HMI_VIEW_WAVEFORM;
 	g_wave_refresh_pending = 0U;
 
 	// ===== 第一段：准备采样 =====
@@ -386,28 +416,74 @@ void Task_Signal_Processing(void)
 	// ===== 第八段：交给显示层 =====
 	// 只有完整成功的一帧才覆盖当前显示；不按键时该缓存保持不变。
 	g_screen_data = g_working_screen_data;
+	g_render_view = requested_view;
 	SerialScreen_Render_Task(&g_screen_data);
 
 	// ===== FireWater 协议输出 =====
 	// 格式：每行逗号分隔，换行触发 FireWater 绘图。
 	// 计数测试：:frame, … , f1_kHz, Vpp_V, Vrms_V
+#if TASK_DEBUG_FIREWATER_OUTPUT
 	printf(":cnt,%lu,:f1,%.1f,:Vpp,%.3f,:Vrms,%.3f\n",
 	       (unsigned long)frame_cnt,
 	       g_screen_data.f1_base_freq / 1000.0f,
 	       g_screen_data.Vpp_val / 1000.0f,
 	       g_screen_data.Vrms_val / 1000.0f);
+#endif
 	frame_cnt++;
 	ADC_Measure_ReleaseFrame();
 }
 
 void SerialScreen_Render_Task(const SerialScreenData_t *data)
 {
-	// 当前版本先预留接口，后续由串口显示协议实现真正发送。
-	(void)data;
+	if (data == NULL) {
+		return;
+	}
+
+	if (g_render_view == HMI_VIEW_SPECTRUM) {
+		(void)HMI_SendSpectrum(data);
+		return;
+	}
+
+	// page0 当前页：n1=峰峰值(mV)，n2=有效值(mV)，n3=基频(Hz)。
+	// 数字控件只接受整数；当前三项本来就按 mV/Hz 显示，无需传浮点字符串。
+	char command[40];
+	snprintf(command, sizeof(command), "n1.val=%lu",
+	         (unsigned long)(data->Vpp_val + 0.5f));
+	HMISendString(command);
+
+	snprintf(command, sizeof(command), "n2.val=%lu",
+	         (unsigned long)(data->Vrms_val + 0.5f));
+	HMISendString(command);
+
+	snprintf(command, sizeof(command), "n3.val=%lu",
+	         (unsigned long)(data->f1_base_freq + 0.5f));
+	HMISendString(command);
+
+	(void)HMI_SendWaveform(data->wave_pixels, HMI_WAVE_SOURCE_POINTS);
+}
+
+void SerialScreen_Init(void)
+{
+	g_serial_cmd_length = 0U;
+	g_serial_cmd_buffer[0] = '\0';
+	g_hmi_addt_ready = 0U;
+	g_hmi_addt_finished = 0U;
+	(void)HAL_UART_Receive_IT(&huart1, &g_hmi_rx_byte, 1U);
 }
 
 void SerialScreen_Rx_Handler(uint8_t rx_byte)
 {
+	// addt 透传握手：0xFE 表示屏幕已准备接收原始曲线字节，
+	// 0xFD 表示指定数量的数据已经接收完成。
+	if (rx_byte == 0xFEU) {
+		g_hmi_addt_ready = 1U;
+		return;
+	}
+	if (rx_byte == 0xFDU) {
+		g_hmi_addt_finished = 1U;
+		return;
+	}
+
 	// 串口命令是“边收边拼”的，方便识别类似 W1 / W3 这种简单控制指令。
 	if (rx_byte == '\r' || rx_byte == '\n' || rx_byte == 0xFFU) {
 		// 一行命令结束，清空缓冲区，准备接收下一条。
@@ -441,6 +517,14 @@ void SerialScreen_Rx_Handler(uint8_t rx_byte)
 		Task_RequestWaveRefresh(3U);
 		g_serial_cmd_length = 0U;
 		g_serial_cmd_buffer[0] = '\0';
+		return;
+	}
+
+	// page1 的“刷新频谱”按钮发送 ASCII 'S'（0x53）。
+	if (rx_byte == 'S' || rx_byte == 's') {
+		Task_RequestSpectrumRefresh();
+		g_serial_cmd_length = 0U;
+		g_serial_cmd_buffer[0] = '\0';
 	}
 }
 
@@ -448,8 +532,6 @@ void SerialScreen_Rx_Handler(uint8_t rx_byte)
  * printf 串口重定向（前提：CubeMX 中配好 USART1，hal_conf.h 中启用 HAL_UART_MODULE_ENABLED）
  * 配置完成后，printf / SerialScreen_Render_Task 均可直接发数据到串口助手。
  */
-extern UART_HandleTypeDef huart1;
-
 int fputc(int ch, FILE *f)
 {
 	(void)f;
@@ -465,7 +547,7 @@ static void UART_SendByte(uint8_t byte)
 }
 
 // 发送指令到陶晶驰串口屏（ASCII 串 + 3 字节 0xFF 帧尾）
-void HMISendString(char *str)
+static void HMISendString(const char *str)
 {
 	while (*str) {
 		UART_SendByte((uint8_t)*str++);
@@ -473,5 +555,147 @@ void HMISendString(char *str)
 	UART_SendByte(0xFF);
 	UART_SendByte(0xFF);
 	UART_SendByte(0xFF);
+}
+
+static HAL_StatusTypeDef HMI_SendWaveform(const uint16_t *wave_pixels, uint16_t source_count)
+{
+	if (wave_pixels == NULL || source_count < 2U) {
+		return HAL_ERROR;
+	}
+
+	// s0 横向宽度为 800 像素。把算法生成的 120 点线性展开到 800 点，
+	// 从而让一次静态帧铺满整个曲线控件，而不是只占左侧 120 像素。
+	for (uint16_t i = 0U; i < HMI_WAVE_TX_POINTS; i++) {
+		float32_t source_pos =
+		    ((float32_t)i * (float32_t)(source_count - 1U)) /
+		    (float32_t)(HMI_WAVE_TX_POINTS - 1U);
+		uint16_t left = (uint16_t)source_pos;
+		uint16_t right = (left + 1U < source_count) ? (left + 1U) : left;
+		float32_t fraction = source_pos - (float32_t)left;
+		float32_t pixel =
+		    (float32_t)wave_pixels[left] +
+		    ((float32_t)wave_pixels[right] - (float32_t)wave_pixels[left]) * fraction;
+
+		if (pixel < 0.0f) {
+			pixel = 0.0f;
+		} else if (pixel > 255.0f) {
+			pixel = 255.0f;
+		}
+
+		// wave_pixels 保存的是屏幕 Y 坐标（越小越高），曲线控件的数据值则越大越高。
+		g_hmi_wave_tx[i] = (uint8_t)(255.0f - pixel + 0.5f);
+	}
+
+	return HMI_SendCurveBytes(HMI_WAVE_TX_POINTS);
+}
+
+static HAL_StatusTypeDef HMI_SendSpectrum(const SerialScreenData_t *data)
+{
+	if (data == NULL) {
+		return HAL_ERROR;
+	}
+
+	char command[40];
+	float32_t max_amp = 0.0f;
+
+	// page1：n0~n2 显示各分量峰值(mV)，n3~n5 显示各分量频率(Hz)。
+	for (uint8_t i = 0U; i < 3U; i++) {
+		float32_t amp_mv = (i < data->harmonic_count) ? data->harmonic_amp[i] : 0.0f;
+		float32_t freq_hz = (i < data->harmonic_count)
+		                  ? data->harmonic_freq[i] * 1000.0f
+		                  : 0.0f;
+
+		snprintf(command, sizeof(command), "n%u.val=%lu",
+		         (unsigned int)i,
+		         (unsigned long)(amp_mv + 0.5f));
+		HMISendString(command);
+
+		snprintf(command, sizeof(command), "n%u.val=%lu",
+		         (unsigned int)(i + 3U),
+		         (unsigned long)(freq_hz + 0.5f));
+		HMISendString(command);
+
+		if (amp_mv > max_amp) {
+			max_amp = amp_mv;
+		}
+	}
+
+	// 曲线控件被用作离散线谱画布：横轴固定为 0~500 kHz，
+	// 纵轴按本帧最大分量自动缩放，保证较小谐波也能清楚看见。
+	memset(g_hmi_wave_tx, 10, HMI_SPECTRUM_TX_POINTS);
+	if (max_amp > 0.0f) {
+		uint8_t component_count = (data->harmonic_count < 3U)
+		                        ? data->harmonic_count
+		                        : 3U;
+		for (uint8_t i = 0U; i < component_count; i++) {
+			float32_t freq_khz = data->harmonic_freq[i];
+			if (freq_khz < 0.0f) {
+				freq_khz = 0.0f;
+			} else if (freq_khz > 500.0f) {
+				freq_khz = 500.0f;
+			}
+
+			uint16_t x = (uint16_t)(
+			    freq_khz / 500.0f * (float32_t)(HMI_SPECTRUM_TX_POINTS - 1U) + 0.5f);
+			float32_t ratio = data->harmonic_amp[i] / max_amp;
+			if (ratio < 0.0f) {
+				ratio = 0.0f;
+			} else if (ratio > 1.0f) {
+				ratio = 1.0f;
+			}
+			uint8_t peak = (uint8_t)(30.0f + ratio * 205.0f + 0.5f);
+			g_hmi_wave_tx[x] = peak;
+			if (x + 1U < HMI_SPECTRUM_TX_POINTS) {
+				g_hmi_wave_tx[x + 1U] = peak;
+			}
+		}
+	}
+
+	return HMI_SendCurveBytes(HMI_SPECTRUM_TX_POINTS);
+}
+
+static HAL_StatusTypeDef HMI_SendCurveBytes(uint16_t point_count)
+{
+	if (point_count == 0U || point_count > HMI_WAVE_TX_POINTS) {
+		return HAL_ERROR;
+	}
+
+	HMISendString("cle s0.id,0");
+
+	char command[32];
+	snprintf(command, sizeof(command), "addt s0.id,0,%u",
+	         (unsigned int)point_count);
+	g_hmi_addt_ready = 0U;
+	g_hmi_addt_finished = 0U;
+	HMISendString(command);
+
+	uint32_t wait_start = HAL_GetTick();
+	while ((g_hmi_addt_ready == 0U) &&
+	       ((HAL_GetTick() - wait_start) < HMI_ADD_READY_TIMEOUT_MS)) {
+	}
+	if (g_hmi_addt_ready == 0U) {
+		return HAL_TIMEOUT;
+	}
+
+	return HAL_UART_Transmit(&huart1,
+	                         g_hmi_wave_tx,
+	                         point_count,
+	                         HMI_ADD_READY_TIMEOUT_MS);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (huart != NULL && huart->Instance == USART1) {
+		SerialScreen_Rx_Handler(g_hmi_rx_byte);
+		(void)HAL_UART_Receive_IT(&huart1, &g_hmi_rx_byte, 1U);
+	}
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+	if (huart != NULL && huart->Instance == USART1) {
+		__HAL_UART_CLEAR_OREFLAG(huart);
+		(void)HAL_UART_Receive_IT(&huart1, &g_hmi_rx_byte, 1U);
+	}
 }
 
