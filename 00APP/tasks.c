@@ -35,6 +35,7 @@ static const float32_t TASK_BASE_MIN_FREQ_HZ = 10000.0f;
 static const float32_t TASK_BASE_MAX_FREQ_HZ = 250000.0f;
 static const float32_t TASK_COMPONENT_MAX_FREQ_HZ = 500000.0f;
 static const float32_t TASK_FREQ_EDGE_TOLERANCE_HZ = 250.0f;
+static const float32_t TASK_HARMONIC_FREQ_TOLERANCE_HZ = TASK_FREQ_GRID_HZ;
 
 #define TASK_SPECTRAL_CANDIDATE_MAX 12U
 
@@ -366,7 +367,7 @@ void Task_Signal_Processing(void)
 			break;
 		}
 
-		// 理论谐波频率。
+		// 对外发布的谐波频率必须严格等于吸附后基波的整数倍。
 		float32_t f_target = f1 * (float32_t)harmonic;
 
 		// 终止条件二：超出题目规定的 500kHz 上限，不再继续搜索。
@@ -374,9 +375,10 @@ void Task_Signal_Processing(void)
 			break;
 		}
 
-		// 在理论位置附近找一个局部最大值。
-		int bin_target = (int)(f_target / FFT_BIN_WIDTH_HZ);
-		int k_h = FFT_Find_Local_Max_Bin(rfft_mag, bin_target - 3, bin_target + 3);
+		// 搜峰中心使用未经500 Hz吸附的实测基波，避免谐波次数较高时累积网格误差。
+		float32_t f_target_measured = f1_measured * (float32_t)harmonic;
+		int bin_target = (int)(f_target_measured / FFT_BIN_WIDTH_HZ + 0.5f);
+		int k_h = FFT_Find_Local_Max_Bin(rfft_mag, bin_target - 2, bin_target + 2);
 		if (k_h < 1) {
 			// 这附近根本没有像样的峰，说明该次谐波不存在或太弱。
 			continue;
@@ -395,10 +397,14 @@ void Task_Signal_Processing(void)
 		// 同样做一次补偿，保持各次谐波口径一致（暂关）。
 		// Ah = SIG_Apply_LUT_Compensation(fh, Ah);
 
+		// 附近的干扰或噪声峰不能冒充谐波：Rife细化后的频率必须仍贴近 n*f1。
+		if (fabsf(fh - f_target_measured) > TASK_HARMONIC_FREQ_TOLERANCE_HZ) {
+			continue;
+		}
+
 		if (Ah * 1000.0f > 1.0f) {
-			// 只有幅值足够明显的谐波才写入屏幕数据。
-			fh = Task_SnapFrequencyToGrid(fh);
-			g_working_screen_data.harmonic_freq[h_count] = fh / 1000.0f;
+			// 频率按谐波定义发布为 n*f1；实测峰只负责确认该分量并估算幅值。
+			g_working_screen_data.harmonic_freq[h_count] = f_target / 1000.0f;
 			g_working_screen_data.harmonic_amp[h_count] = Ah * 1000.0f;
 			h_count++;
 		}
