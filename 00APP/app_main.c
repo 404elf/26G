@@ -6,14 +6,14 @@ void ADC_Measure_Init(void);
 void Measure_ADC_HalfCpltCallback(void);
 void Measure_ADC_FullCpltCallback(void);
 void FFT_Init(void);
-void VCA821_Init(void);
+
 
 void app_init(void)
 {
     // 只初始化，不启动采样——由 Task_Signal_Processing 统一管理 Start → Wait → Stop 周期。
     ADC_Measure_Init();
     FFT_Init();
-    VCA821_Init();
+
     SerialScreen_Init();
 }
 

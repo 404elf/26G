@@ -4,7 +4,7 @@
 
 #include "adc.h"
 #include "tim.h"
-#include "VCA821.h"
+
 #include "sig_util.h"
 
 // 原始 DMA 缓冲区放在 IRAM2，便于和主内存分离。
@@ -262,7 +262,7 @@ void ADC_Cal_Vpp(uint16_t *pBuffer, uint16_t length, uint8_t ping_pong_index)
 float Get_Vpp(void)
 {
     // 使用统一的 DMA 缓冲和增益信息来计算峰峰值。
-    return SIG_Calculate_Vpp(adc_dma_buf, VCA821_GetLinearGain());
+    return SIG_Calculate_Vpp(adc_dma_buf, 1.0f);
 }
 
 void Measure_ADC_HalfCpltCallback(void)

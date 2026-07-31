@@ -3,7 +3,7 @@
 #include <math.h>
 
 #include "adc_measure.h"
-#include "VCA821.h"
+
 
 // FFT 运行实例，初始化后供后续每帧复用。
 arm_rfft_fast_instance_f32 g_rfft_instance;

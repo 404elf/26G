@@ -5,7 +5,7 @@
 #include <string.h>
 
 #include "FFT.h"
-#include "VCA821.h"
+
 #include "adc_measure.h"
 #include "sig_util.h"
 #include "usart.h"
@@ -298,7 +298,7 @@ void Task_Signal_Processing(void)
 	g_wave_refresh_pending = 0U;
 
 	// ===== 第一段：准备采样 =====
-	float gain_snapshot = VCA821_GetLinearGain();
+	const float gain_snapshot = 1.0f;
 
 	// 单次触发 DMA。启动步骤失败时直接保留诊断现场，不进入无意义的等待。
 	if (ADC_Measure_Start() != HAL_OK) {

@@ -1139,13 +1139,6 @@
         </Group>
         <Group>
           <GroupName>02BSP</GroupName>
-          <Files>
-            <File>
-              <FileName>VCA821.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\02BSP\VCA821.c</FilePath>
-            </File>
-          </Files>
         </Group>
         <Group>
           <GroupName>03DRV</GroupName>
