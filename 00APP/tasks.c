@@ -15,9 +15,10 @@
 #define TASK_DEBUG_AUTO_REFRESH 0
 #define TASK_DEBUG_FIREWATER_OUTPUT 0
 
-#define HMI_WAVE_SOURCE_POINTS 120U
+#define HMI_WAVE_SOURCE_POINTS SERIAL_SCREEN_WAVE_POINTS
 #define HMI_WAVE_TX_POINTS 800U
 #define HMI_SPECTRUM_TX_POINTS 557U
+#define HMI_SPECTRUM_SIDE_MARGIN 16U
 #define HMI_ADD_READY_TIMEOUT_MS 100U
 #define HMI_VIEW_WAVEFORM 0U
 #define HMI_VIEW_SPECTRUM 1U
@@ -30,8 +31,10 @@ static const uint32_t TASK_SAMPLE_TIMEOUT_MS = 10U;
 static const float32_t TASK_HARMONIC_NOISE_FLOOR_V = 0.002f;
 static const float32_t TASK_BASE_MIN_AMP_V = 0.003f;
 static const float32_t TASK_FREQ_GRID_HZ = 500.0f;
-static const float32_t TASK_SIGNAL_MIN_FREQ_HZ = 10000.0f;
-static const float32_t TASK_SIGNAL_MAX_FREQ_HZ = 500000.0f;
+static const float32_t TASK_BASE_MIN_FREQ_HZ = 10000.0f;
+static const float32_t TASK_BASE_MAX_FREQ_HZ = 250000.0f;
+static const float32_t TASK_COMPONENT_MAX_FREQ_HZ = 500000.0f;
+static const float32_t TASK_FREQ_EDGE_TOLERANCE_HZ = 250.0f;
 
 #define TASK_SPECTRAL_CANDIDATE_MAX 12U
 
@@ -168,8 +171,12 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 	Task_SpectralCandidate_t candidates[TASK_SPECTRAL_CANDIDATE_MAX];
 	uint8_t candidate_count = 0U;
 
-	int start_bin = (int)ceilf(TASK_SIGNAL_MIN_FREQ_HZ / FFT_BIN_WIDTH_HZ);
-	int end_bin = (int)floorf(TASK_SIGNAL_MAX_FREQ_HZ / FFT_BIN_WIDTH_HZ);
+	// 搜索范围比题设边界各放宽半个500 Hz网格，避免Rife插值的微小抖动
+	// 把恰好10 kHz或500 kHz的有效谱线挡在门外。
+	int start_bin = (int)floorf(
+	    (TASK_BASE_MIN_FREQ_HZ - TASK_FREQ_EDGE_TOLERANCE_HZ) / FFT_BIN_WIDTH_HZ);
+	int end_bin = (int)ceilf(
+	    (TASK_COMPONENT_MAX_FREQ_HZ + TASK_FREQ_EDGE_TOLERANCE_HZ) / FFT_BIN_WIDTH_HZ);
 	if (start_bin < 1) {
 		start_bin = 1;
 	}
@@ -188,7 +195,9 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 		float32_t freq_hz = 0.0f;
 		float32_t amp_v = 0.0f;
 		FFT_Rife_Interpolate(bin, &freq_hz, &amp_v, linear_gain);
-		if (freq_hz < TASK_SIGNAL_MIN_FREQ_HZ || freq_hz > TASK_SIGNAL_MAX_FREQ_HZ || amp_v < TASK_BASE_MIN_AMP_V) {
+		if (freq_hz < (TASK_BASE_MIN_FREQ_HZ - TASK_FREQ_EDGE_TOLERANCE_HZ) ||
+		    freq_hz > (TASK_COMPONENT_MAX_FREQ_HZ + TASK_FREQ_EDGE_TOLERANCE_HZ) ||
+		    amp_v < TASK_BASE_MIN_AMP_V) {
 			continue;
 		}
 
@@ -196,6 +205,10 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 		candidate.bin = bin;
 		candidate.freq_hz = Task_SnapFrequencyToGrid(freq_hz);
 		candidate.amp_v = amp_v;
+		if (candidate.freq_hz < TASK_BASE_MIN_FREQ_HZ ||
+		    candidate.freq_hz > TASK_COMPONENT_MAX_FREQ_HZ) {
+			continue;
+		}
 		Task_InsertSpectralCandidate(candidates, &candidate_count, candidate);
 	}
 
@@ -208,6 +221,12 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 	int best_index = -1;
 	uint8_t best_match_count = 0U;
 	for (uint8_t i = 0U; i < candidate_count; i++) {
+		// 250~500 kHz的谱线只允许作为谐波参与匹配，不能被选成题设基波。
+		if (candidates[i].freq_hz < TASK_BASE_MIN_FREQ_HZ ||
+		    candidates[i].freq_hz > TASK_BASE_MAX_FREQ_HZ) {
+			continue;
+		}
+
 		uint32_t base_grid = (uint32_t)(candidates[i].freq_hz / TASK_FREQ_GRID_HZ + 0.5f);
 		if (base_grid == 0U) {
 			continue;
@@ -319,7 +338,7 @@ void Task_Signal_Processing(void)
 	float32_t A1 = 0.0f;
 	FFT_Rife_Interpolate(k_base, &f1_measured, &A1, gain_snapshot);
 	float32_t f1 = Task_SnapFrequencyToGrid(f1_measured);
-	if (f1 < TASK_SIGNAL_MIN_FREQ_HZ || f1 > TASK_SIGNAL_MAX_FREQ_HZ) {
+	if (f1 < TASK_BASE_MIN_FREQ_HZ || f1 > TASK_BASE_MAX_FREQ_HZ) {
 		ADC_Measure_ReleaseFrame();
 		return;
 	}
@@ -351,7 +370,7 @@ void Task_Signal_Processing(void)
 		float32_t f_target = f1 * (float32_t)harmonic;
 
 		// 终止条件二：超出题目规定的 500kHz 上限，不再继续搜索。
-		if (f_target > 500000.0f) {
+		if (f_target > TASK_COMPONENT_MAX_FREQ_HZ) {
 			break;
 		}
 
@@ -403,13 +422,13 @@ void Task_Signal_Processing(void)
 	}
 	float32_t wave_start = (max_span - wave_span) * 0.5f;
 
-	// 浮点起点 + 浮点跨度直接生成 120 点，避免整数截断导致周期不足。
+	// 浮点起点 + 浮点跨度直接生成高密度显示点，避免整数截断和点数过少造成折线感。
 	SIG_CubicSpline_ResampleWindow(rfft_time_domain,
 	                               FFT_LENGTH,
 	                               wave_start,
 	                               wave_span,
 	                               g_working_screen_data.wave_pixels,
-	                               120U);
+	                               HMI_WAVE_SOURCE_POINTS);
 	// 柱状图则由谐波幅值直接生成。
 	Task_UpdateSpectrumBars(&g_working_screen_data, h_count);
 
@@ -563,8 +582,8 @@ static HAL_StatusTypeDef HMI_SendWaveform(const uint16_t *wave_pixels, uint16_t 
 		return HAL_ERROR;
 	}
 
-	// s0 横向宽度为 800 像素。把算法生成的 120 点线性展开到 800 点，
-	// 从而让一次静态帧铺满整个曲线控件，而不是只占左侧 120 像素。
+	// s0 横向宽度为 800 像素。把算法生成的高密度静态帧展开到 800 点，
+	// 既铺满整个曲线控件，也降低低源点数造成的折线感。
 	for (uint16_t i = 0U; i < HMI_WAVE_TX_POINTS; i++) {
 		float32_t source_pos =
 		    ((float32_t)i * (float32_t)(source_count - 1U)) /
@@ -620,7 +639,8 @@ static HAL_StatusTypeDef HMI_SendSpectrum(const SerialScreenData_t *data)
 		}
 	}
 
-	// 曲线控件被用作离散线谱画布：横轴固定为 0~500 kHz，
+	// 曲线控件被用作离散线谱画布：有效横轴为 10~500 kHz，
+	// 两端各留少量空白，避免边界频率的谱线贴边后看不完整。
 	// 纵轴按本帧最大分量自动缩放，保证较小谐波也能清楚看见。
 	memset(g_hmi_wave_tx, 10, HMI_SPECTRUM_TX_POINTS);
 	if (max_amp > 0.0f) {
@@ -629,14 +649,18 @@ static HAL_StatusTypeDef HMI_SendSpectrum(const SerialScreenData_t *data)
 		                        : 3U;
 		for (uint8_t i = 0U; i < component_count; i++) {
 			float32_t freq_khz = data->harmonic_freq[i];
-			if (freq_khz < 0.0f) {
-				freq_khz = 0.0f;
+			if (freq_khz < 10.0f) {
+				freq_khz = 10.0f;
 			} else if (freq_khz > 500.0f) {
 				freq_khz = 500.0f;
 			}
 
+			float32_t normalized_freq = (freq_khz - 10.0f) / 490.0f;
+			uint16_t drawable_width =
+			    HMI_SPECTRUM_TX_POINTS - 1U - 2U * HMI_SPECTRUM_SIDE_MARGIN;
 			uint16_t x = (uint16_t)(
-			    freq_khz / 500.0f * (float32_t)(HMI_SPECTRUM_TX_POINTS - 1U) + 0.5f);
+			    (float32_t)HMI_SPECTRUM_SIDE_MARGIN +
+			    normalized_freq * (float32_t)drawable_width + 0.5f);
 			float32_t ratio = data->harmonic_amp[i] / max_amp;
 			if (ratio < 0.0f) {
 				ratio = 0.0f;
@@ -644,6 +668,9 @@ static HAL_StatusTypeDef HMI_SendSpectrum(const SerialScreenData_t *data)
 				ratio = 1.0f;
 			}
 			uint8_t peak = (uint8_t)(30.0f + ratio * 205.0f + 0.5f);
+			if (x > 0U) {
+				g_hmi_wave_tx[x - 1U] = peak;
+			}
 			g_hmi_wave_tx[x] = peak;
 			if (x + 1U < HMI_SPECTRUM_TX_POINTS) {
 				g_hmi_wave_tx[x + 1U] = peak;

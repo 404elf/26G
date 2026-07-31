@@ -4,6 +4,8 @@
 #include "stm32f4xx_hal.h"
 #include <stdint.h>
 
+#define SERIAL_SCREEN_WAVE_POINTS 400U
+
 // 这一组数据就是屏幕最终要显示的内容，包含频率、幅值、波形和柱状图。
 typedef struct {
 	float f1_base_freq;
@@ -15,7 +17,7 @@ typedef struct {
 	float harmonic_amp[4];
 
 	uint8_t wave_disp_mode;
-	uint16_t wave_pixels[120];
+	uint16_t wave_pixels[SERIAL_SCREEN_WAVE_POINTS];
 	uint16_t spec_bar_x[4];
 	uint16_t spec_bar_y[4];
 } SerialScreenData_t;
