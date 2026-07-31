@@ -9,6 +9,10 @@
 #include "adc_measure.h"
 #include "sig_util.h"
 
+// 调试阶段设为 1：主循环每次都自动请求一帧，方便在监视窗口连续观察数据。
+// 串口屏接入后改为 0：恢复为仅收到 W1/W3 时刷新一次静态帧。
+#define TASK_DEBUG_AUTO_REFRESH 1
+
 // 屏幕显示数据放在 IRAM1，减少和 DMA/FFT 缓冲区的冲突。
 SerialScreenData_t g_screen_data __attribute__((section(".iram1")));
 
@@ -232,6 +236,10 @@ void Task_RequestWaveRefresh(uint8_t wave_mode)
 void Task_Signal_Processing(void)
 {
 	static uint32_t frame_cnt = 0;
+#if TASK_DEBUG_AUTO_REFRESH
+	// 只补充刷新请求，不覆盖 requested_wave_mode；以后即使接入 W3，自动调试也能保持三周期模式。
+	g_wave_refresh_pending = 1U;
+#endif
 	if (g_wave_refresh_pending == 0U) {
 		return;
 	}
