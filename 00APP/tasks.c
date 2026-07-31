@@ -65,8 +65,12 @@ void Task_Signal_Processing(void)
 	// ===== 第一段：准备采样 =====
 	float gain_snapshot = VCA821_GetLinearGain();
 
-	// 单次触发 DMA，等它跑完再处理。
-	ADC_Measure_Start();
+	// 单次触发 DMA。启动步骤失败时直接保留诊断现场，不进入无意义的等待。
+	if (ADC_Measure_Start() != HAL_OK) {
+		ADC_Measure_Stop();
+		Task_ResetScreenData();
+		return;
+	}
 
 	// ===== 第二段：等待 DMA 完成 =====
 	uint32_t wait_start = HAL_GetTick();
@@ -74,14 +78,16 @@ void Task_Signal_Processing(void)
 	}
 	if (adc_buffer_ready == 0U) {
 		ADC_Measure_Stop();
-		ADC_Measure_Init();
 		Task_ResetScreenData();
 		return;
 	}
-	adc_buffer_ready = 0U;
 
-	// DMA 已停（Normal 模式），但 ADC+TIM8 仍在跑，必须先停掉为下轮 Start 清状态。
-	ADC_Measure_Stop();
+	// DMA 回调已经冻结硬件；这里只同步 HAL 句柄并取得这一帧的独占处理权。
+	if (ADC_Measure_TakeFrame() != HAL_OK) {
+		ADC_Measure_Stop();
+		Task_ResetScreenData();
+		return;
+	}
 
 	// ===== 第三段：做频域分析 =====
 	// DMA 已完成，直接处理 adc_dma_buf。
@@ -93,6 +99,7 @@ void Task_Signal_Processing(void)
 	if (k_base < 1) {
 		// 连基波都没找到，说明这一帧数据不可靠或者信号过弱，直接清屏并返回。
 		Task_ResetScreenData();
+		ADC_Measure_ReleaseFrame();
 		return;
 	}
 
@@ -154,7 +161,7 @@ void Task_Signal_Processing(void)
 		// 同样做一次补偿，保持各次谐波口径一致（暂关）。
 		// Ah = SIG_Apply_LUT_Compensation(fh, Ah);
 
-		if (Ah * 1000.0f > 5.0f) {
+		if (Ah * 1000.0f > 1.0f) {
 			// 只有幅值足够明显的谐波才写入屏幕数据。
 			g_screen_data.harmonic_freq[h_count] = fh / 1000.0f;
 			g_screen_data.harmonic_amp[h_count] = Ah * 1000.0f;
@@ -216,6 +223,7 @@ void Task_Signal_Processing(void)
 	       g_screen_data.Vpp_val / 1000.0f,
 	       g_screen_data.Vrms_val / 1000.0f);
 	frame_cnt++;
+	ADC_Measure_ReleaseFrame();
 }
 
 void SerialScreen_Render_Task(const SerialScreenData_t *data)

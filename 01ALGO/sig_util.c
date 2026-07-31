@@ -94,7 +94,7 @@ float SIG_Calculate_Vpp(const uint32_t *dma_buf, float linear_gain)
 		return 0.0f;
 	}
 
-	// 先用 ADC 原始码值（12 位整数）做 Top-5 极值统计，避免循环内大量浮点除法。
+	// Top-5 极值统计：剔除偶发毛刺，用第 5 大减第 5 小算 Vpp。
 	int32_t smallest[5] = { 9999, 9999, 9999, 9999, 9999 };
 	int32_t largest[5] = { -1, -1, -1, -1, -1 };
 
@@ -109,7 +109,6 @@ float SIG_Calculate_Vpp(const uint32_t *dma_buf, float linear_gain)
 		if (s1 > largest[4])  { SIG_InsertDescending_s32(largest, 4U, s1); }
 	}
 
-	// 只在最后把第 5 大 / 第 5 小的码值换算成电压，再做增益还原。
 	float32_t v_max = (float32_t)largest[4] * 3.3f / 4096.0f;
 	float32_t v_min = (float32_t)smallest[4] * 3.3f / 4096.0f;
 	float32_t gain = (linear_gain > 0.0f) ? linear_gain : 1.0f;

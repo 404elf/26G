@@ -12,48 +12,230 @@ uint32_t adc_dma_buf[ADC_DMA_WORDS] __attribute__((section(".iram2")));
 // FullCplt 时从 DMA 区拷贝到此处（IRAM1），任务层安全读取。
 uint32_t adc_safe_buf[ADC_DMA_WORDS] __attribute__((section(".iram1")));
 
-// 采样完成标志：由 ADC FullCplt 回调置 1，任务层轮询读取。
-volatile uint8_t adc_buffer_ready = 0;
+// ISR 与任务层共享的帧状态。
+volatile uint8_t adc_buffer_ready = 0U;
+volatile ADC_MeasureState_t adc_measure_state = ADC_MEASURE_STATE_IDLE;
 
-// 统一清理采样状态。
-static void ADC_Measure_ClearState(void)
+// 启动、完成和超时诊断。
+volatile uint8_t adc_last_start_stage = 0U;
+volatile HAL_StatusTypeDef adc_last_hal_status = HAL_OK;
+volatile uint32_t adc_start_count = 0U;
+volatile uint32_t adc_full_callback_count = 0U;
+volatile uint32_t adc_process_count = 0U;
+volatile uint32_t adc_timeout_count = 0U;
+volatile uint32_t adc_last_dma_ndtr = 0U;
+volatile uint32_t adc_last_dma_cr = 0U;
+volatile uint32_t adc_last_dma_lisr = 0U;
+volatile uint32_t adc_last_adc_sr = 0U;
+volatile uint32_t adc_last_adc_cr2 = 0U;
+volatile uint32_t adc_last_adc_ccr = 0U;
+volatile uint32_t adc_last_tim8_cr1 = 0U;
+
+static void ADC_Measure_RecordStartFailure(uint8_t stage, HAL_StatusTypeDef status)
 {
-    adc_buffer_ready = 0;
+    adc_last_start_stage = stage;
+    adc_last_hal_status = status;
+    adc_measure_state = ADC_MEASURE_STATE_ERROR;
+}
+
+static void ADC_Measure_CaptureRegisters(void)
+{
+    if (hadc1.DMA_Handle != NULL) {
+        adc_last_dma_ndtr = hadc1.DMA_Handle->Instance->NDTR;
+        adc_last_dma_cr = hadc1.DMA_Handle->Instance->CR;
+    }
+    adc_last_dma_lisr = DMA2->LISR;
+    adc_last_adc_sr = hadc1.Instance->SR;
+    adc_last_adc_cr2 = hadc1.Instance->CR2;
+    adc_last_adc_ccr = ADC_COMMON_REGISTER(&hadc1)->CCR;
+    adc_last_tim8_cr1 = htim8.Instance->CR1;
+}
+
+// 仅冻结硬件，不调用会操作 HAL Lock/State 的函数；可安全用于 DMA 完成回调。
+static void ADC_Measure_FreezeHardware(void)
+{
+    CLEAR_BIT(htim8.Instance->CR1, TIM_CR1_CEN);
+    CLEAR_BIT(hadc1.Instance->CR2, ADC_CR2_ADON);
+    CLEAR_BIT(hadc2.Instance->CR2, ADC_CR2_ADON);
+    CLEAR_BIT(hadc3.Instance->CR2, ADC_CR2_ADON);
+    CLEAR_BIT(ADC_COMMON_REGISTER(&hadc1)->CCR, ADC_CCR_DDS);
+    __HAL_ADC_DISABLE_IT(&hadc1, ADC_IT_OVR);
+}
+
+// 仅在任务上下文调用：让 HAL 句柄状态与已经停止的硬件保持一致。
+static void ADC_Measure_SyncStoppedHandles(void)
+{
+    (void)HAL_TIM_Base_Stop(&htim8);
+    (void)HAL_ADC_Stop(&hadc1);
+    (void)HAL_ADC_Stop(&hadc2);
+    (void)HAL_ADC_Stop(&hadc3);
+    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_EOC | ADC_FLAG_OVR);
+    __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_EOC | ADC_FLAG_OVR);
+    __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_EOC | ADC_FLAG_OVR);
+}
+
+static HAL_StatusTypeDef ADC_Measure_ResetMultimodeSequencer(void)
+{
+    ADC_Common_TypeDef *common = ADC_COMMON_REGISTER(&hadc1);
+    ADC_MultiModeTypeDef multimode;
+
+    // RM0090：交错序列被 DMA 传输结束打断后，必须先回到独立模式再重编程交错模式。
+    CLEAR_BIT(common->CCR, ADC_CCR_MULTI | ADC_CCR_DMA);
+    __DSB();
+
+    multimode.Mode = ADC_TRIPLEMODE_INTERL;
+    multimode.DMAAccessMode = ADC_DMAACCESSMODE_2;
+    multimode.TwoSamplingDelay = ADC_TWOSAMPLINGDELAY_5CYCLES;
+    return HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode);
 }
 
 void ADC_Measure_Init(void)
 {
+    ADC_Measure_FreezeHardware();
+    ADC_Measure_SyncStoppedHandles();
     memset(adc_dma_buf, 0, sizeof(adc_dma_buf));
-    ADC_Measure_ClearState();
+
+    adc_buffer_ready = 0U;
+    adc_measure_state = ADC_MEASURE_STATE_IDLE;
+    adc_last_start_stage = 0U;
+    adc_last_hal_status = HAL_OK;
+    adc_start_count = 0U;
+    adc_full_callback_count = 0U;
+    adc_process_count = 0U;
+    adc_timeout_count = 0U;
+    ADC_Measure_CaptureRegisters();
 }
 
-void ADC_Measure_Start(void)
+HAL_StatusTypeDef ADC_Measure_Start(void)
 {
+    HAL_StatusTypeDef status;
+    DMA_HandleTypeDef *hdma = hadc1.DMA_Handle;
+
+    adc_last_start_stage = 0U;
+    adc_last_hal_status = HAL_OK;
+
+    if (adc_measure_state != ADC_MEASURE_STATE_IDLE) {
+        ADC_Measure_RecordStartFailure(1U, HAL_BUSY);
+        return HAL_BUSY;
+    }
+    adc_measure_state = ADC_MEASURE_STATE_ARMING;
     adc_buffer_ready = 0U;
+    adc_start_count++;
 
-    // 1. 停止上一轮
-    HAL_ADCEx_MultiModeStop_DMA(&hadc1);
-    HAL_ADC_Stop(&hadc2);
-    HAL_ADC_Stop(&hadc3);
+    if (hdma == NULL) {
+        ADC_Measure_RecordStartFailure(2U, HAL_ERROR);
+        return HAL_ERROR;
+    }
 
-    // 2. 三重交错模式必须先手动启动从机 ADC2、ADC3
-    HAL_ADC_Start(&hadc2);
-    HAL_ADC_Start(&hadc3);
+    // 正常帧到这里应已经是 READY；只有检测到上一次异常残留时才执行恢复。
+    if (((hadc1.Instance->CR2 & ADC_CR2_ADON) != RESET) ||
+        ((hadc2.Instance->CR2 & ADC_CR2_ADON) != RESET) ||
+        ((hadc3.Instance->CR2 & ADC_CR2_ADON) != RESET)) {
+        ADC_Measure_FreezeHardware();
+        ADC_Measure_SyncStoppedHandles();
+    }
+    if ((hdma->State != HAL_DMA_STATE_READY) ||
+        (hdma->Lock != HAL_UNLOCKED) ||
+        ((hdma->Instance->CR & DMA_SxCR_EN) != RESET)) {
+        ADC_Measure_FreezeHardware();
+        if (hdma->State == HAL_DMA_STATE_BUSY) {
+            (void)HAL_DMA_Abort(hdma);
+        }
+        status = HAL_DMA_Init(hdma);
+        if (status != HAL_OK) {
+            ADC_Measure_CaptureRegisters();
+            ADC_Measure_RecordStartFailure(2U, status);
+            return status;
+        }
+    }
 
-    // 3. 启动主机 ADC1 + DMA
-    HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)adc_dma_buf, ADC_DMA_WORDS);
+    __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_EOC | ADC_FLAG_OVR);
+    __HAL_ADC_CLEAR_FLAG(&hadc2, ADC_FLAG_EOC | ADC_FLAG_OVR);
+    __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_EOC | ADC_FLAG_OVR);
+    HAL_NVIC_ClearPendingIRQ(DMA2_Stream0_IRQn);
+    __HAL_TIM_SET_COUNTER(&htim8, 0U);
+    __HAL_TIM_CLEAR_FLAG(&htim8, TIM_FLAG_UPDATE);
 
-    // 4. 启动定时器触发源
-    HAL_TIM_Base_Start(&htim8);
+    status = ADC_Measure_ResetMultimodeSequencer();
+    if (status != HAL_OK) {
+        ADC_Measure_CaptureRegisters();
+        ADC_Measure_RecordStartFailure(6U, status);
+        return status;
+    }
+
+    // 三重交替模式：先启动 ADC2、ADC3，再装载主 ADC1 的 DMA Normal 帧。
+    status = HAL_ADC_Start(&hadc2);
+    if (status != HAL_OK) {
+        ADC_Measure_RecordStartFailure(3U, status);
+        ADC_Measure_FreezeHardware();
+        return status;
+    }
+    status = HAL_ADC_Start(&hadc3);
+    if (status != HAL_OK) {
+        ADC_Measure_RecordStartFailure(4U, status);
+        ADC_Measure_FreezeHardware();
+        return status;
+    }
+    status = HAL_ADCEx_MultiModeStart_DMA(&hadc1, adc_dma_buf, ADC_DMA_WORDS);
+    if (status != HAL_OK) {
+        ADC_Measure_RecordStartFailure(5U, status);
+        ADC_Measure_FreezeHardware();
+        return status;
+    }
+
+    // 记录装载后的寄存器现场，但不再用瞬时 EN/NDTR 值阻断本帧。
+    ADC_Measure_CaptureRegisters();
+    adc_measure_state = ADC_MEASURE_STATE_SAMPLING;
+    status = HAL_TIM_Base_Start(&htim8);
+    if (status != HAL_OK) {
+        ADC_Measure_RecordStartFailure(7U, status);
+        ADC_Measure_FreezeHardware();
+        return status;
+    }
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef ADC_Measure_TakeFrame(void)
+{
+    if ((adc_measure_state != ADC_MEASURE_STATE_FRAME_READY) ||
+        (adc_buffer_ready == 0U) ||
+        (hadc1.DMA_Handle == NULL) ||
+        (hadc1.DMA_Handle->State != HAL_DMA_STATE_READY)) {
+        ADC_Measure_CaptureRegisters();
+        return HAL_ERROR;
+    }
+
+    ADC_Measure_SyncStoppedHandles();
+    adc_buffer_ready = 0U;
+    adc_measure_state = ADC_MEASURE_STATE_PROCESSING;
+    adc_process_count++;
+    return HAL_OK;
+}
+
+void ADC_Measure_ReleaseFrame(void)
+{
+    if (adc_measure_state == ADC_MEASURE_STATE_PROCESSING) {
+        adc_measure_state = ADC_MEASURE_STATE_IDLE;
+    }
 }
 
 void ADC_Measure_Stop(void)
 {
-    (void)HAL_TIM_Base_Stop(&htim8);
-    (void)HAL_ADCEx_MultiModeStop_DMA(&hadc1);
-    (void)HAL_ADC_Stop(&hadc2);
-    (void)HAL_ADC_Stop(&hadc3);
-    ADC_Measure_ClearState();
+    ADC_Measure_CaptureRegisters();
+    if (adc_measure_state == ADC_MEASURE_STATE_SAMPLING) {
+        adc_timeout_count++;
+    }
+
+    ADC_Measure_FreezeHardware();
+    if ((hadc1.DMA_Handle != NULL) &&
+        (hadc1.DMA_Handle->State == HAL_DMA_STATE_BUSY)) {
+        (void)HAL_DMA_Abort(hadc1.DMA_Handle);
+    }
+    ADC_Measure_SyncStoppedHandles();
+
+    adc_buffer_ready = 0U;
+    adc_measure_state = ADC_MEASURE_STATE_IDLE;
 }
 
 void ADC_Cal_Vpp(uint16_t *pBuffer, uint16_t length, uint8_t ping_pong_index)
@@ -90,7 +272,11 @@ void Measure_ADC_HalfCpltCallback(void)
 
 void Measure_ADC_FullCpltCallback(void)
 {
-    // DMA FullCplt：先快照到安全区，再置标志，避免任务层读到 DMA 正在覆盖的数据。
-    memcpy(adc_safe_buf, adc_dma_buf, sizeof(adc_safe_buf));
-    adc_buffer_ready = 1;
+    // DMA IRQ 已经把 Normal 流置回 READY；这里只快速冻结硬件并交付稳定的一帧。
+    ADC_Measure_FreezeHardware();
+    adc_last_dma_ndtr = hadc1.DMA_Handle->Instance->NDTR;
+    adc_full_callback_count++;
+    adc_measure_state = ADC_MEASURE_STATE_FRAME_READY;
+    __DMB();
+    adc_buffer_ready = 1U;
 }

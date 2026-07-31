@@ -2,7 +2,6 @@
 
 // 由各功能模块提供，入口层只负责调用。
 void ADC_Measure_Init(void);
-void ADC_Measure_Start(void);
 void Task_Signal_Processing(void);
 void Measure_ADC_HalfCpltCallback(void);
 void Measure_ADC_FullCpltCallback(void);
