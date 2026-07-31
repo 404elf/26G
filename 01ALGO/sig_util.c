@@ -133,6 +133,37 @@ int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg)
 	return -1;
 }
 
+static float32_t SIG_CubicSampleAt(const float *in_pts, uint16_t in_len, float32_t source_pos)
+{
+	if (source_pos < 0.0f) {
+		source_pos = 0.0f;
+	}
+
+	float32_t max_pos = (float32_t)(in_len - 1U);
+	if (source_pos > max_pos) {
+		source_pos = max_pos;
+	}
+
+	int i1 = (int)source_pos;
+	int i0 = (i1 > 0) ? (i1 - 1) : 0;
+	int i2 = (i1 + 1 < (int)in_len) ? (i1 + 1) : (int)in_len - 1;
+	int i3 = (i1 + 2 < (int)in_len) ? (i1 + 2) : (int)in_len - 1;
+
+	float32_t t = source_pos - (float32_t)i1;
+	float32_t t2 = t * t;
+	float32_t t3 = t2 * t;
+
+	float32_t p0 = in_pts[i0];
+	float32_t p1 = in_pts[i1];
+	float32_t p2 = in_pts[i2];
+	float32_t p3 = in_pts[i3];
+
+	return 0.5f * ((2.0f * p1) +
+	               (-p0 + p2) * t +
+	               (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+	               (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+}
+
 void SIG_CubicSpline_Resample(const float *in_pts, uint16_t in_len, uint16_t *out_pixels, uint16_t out_len)
 {
 	if (in_pts == NULL || out_pixels == NULL || in_len < 2U || out_len == 0U) {
@@ -168,26 +199,64 @@ void SIG_CubicSpline_Resample(const float *in_pts, uint16_t in_len, uint16_t *ou
 			source_pos = ((float32_t)out_index * (float32_t)(in_len - 1U)) / (float32_t)(out_len - 1U);
 		}
 
-		int i1 = (int)source_pos;
-		int i0 = (i1 > 0) ? (i1 - 1) : 0;
-		int i2 = (i1 + 1 < (int)in_len) ? (i1 + 1) : (in_len - 1);
-		int i3 = (i1 + 2 < (int)in_len) ? (i1 + 2) : (in_len - 1);
-
-		float32_t t = source_pos - (float32_t)i1;
-		float32_t t2 = t * t;
-		float32_t t3 = t2 * t;
-
-		float32_t p0 = in_pts[i0];
-		float32_t p1 = in_pts[i1];
-		float32_t p2 = in_pts[i2];
-		float32_t p3 = in_pts[i3];
-
-		float32_t interpolated = 0.5f * ((2.0f * p1) +
-		                                 (-p0 + p2) * t +
-		                                 (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
-		                                 (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+		float32_t interpolated = SIG_CubicSampleAt(in_pts, in_len, source_pos);
 
 		// 3. ¹éÒ»»¯²¢Ó³Éäµ½ 20~220 ÏñËØÇø¼ä£¨ÁôÉÏÏÂ±ß¾à£¬±ÜÃâÌùÆÁ±ß£©
+		float32_t normalized = (interpolated - min_value) / range;
+		normalized = SIG_ClampFloat(normalized, 0.0f, 1.0f);
+		float32_t pixel = 220.0f - normalized * 200.0f;
+		out_pixels[out_index] = (uint16_t)(pixel + 0.5f);
+	}
+}
+
+void SIG_CubicSpline_ResampleWindow(const float *in_pts,
+                                    uint16_t in_len,
+                                    float start_pos,
+                                    float span_samples,
+                                    uint16_t *out_pixels,
+                                    uint16_t out_len)
+{
+	if (in_pts == NULL || out_pixels == NULL || in_len < 2U || out_len == 0U || span_samples < 0.0f) {
+		return;
+	}
+
+	float32_t max_pos = (float32_t)(in_len - 1U);
+	start_pos = SIG_ClampFloat(start_pos, 0.0f, max_pos);
+	if (start_pos + span_samples > max_pos) {
+		span_samples = max_pos - start_pos;
+	}
+
+	float32_t min_value = 0.0f;
+	float32_t max_value = 0.0f;
+	for (uint16_t out_index = 0; out_index < out_len; out_index++) {
+		float32_t fraction = (out_len == 1U)
+		                   ? 0.0f
+		                   : (float32_t)out_index / (float32_t)(out_len - 1U);
+		float32_t source_pos = start_pos + fraction * span_samples;
+		float32_t interpolated = SIG_CubicSampleAt(in_pts, in_len, source_pos);
+
+		if (out_index == 0U || interpolated < min_value) {
+			min_value = interpolated;
+		}
+		if (out_index == 0U || interpolated > max_value) {
+			max_value = interpolated;
+		}
+	}
+
+	float32_t range = max_value - min_value;
+	if (range < 1e-6f) {
+		for (uint16_t out_index = 0; out_index < out_len; out_index++) {
+			out_pixels[out_index] = 120U;
+		}
+		return;
+	}
+
+	for (uint16_t out_index = 0; out_index < out_len; out_index++) {
+		float32_t fraction = (out_len == 1U)
+		                   ? 0.0f
+		                   : (float32_t)out_index / (float32_t)(out_len - 1U);
+		float32_t source_pos = start_pos + fraction * span_samples;
+		float32_t interpolated = SIG_CubicSampleAt(in_pts, in_len, source_pos);
 		float32_t normalized = (interpolated - min_value) / range;
 		normalized = SIG_ClampFloat(normalized, 0.0f, 1.0f);
 		float32_t pixel = 220.0f - normalized * 200.0f;

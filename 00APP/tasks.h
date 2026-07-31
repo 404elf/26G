@@ -25,6 +25,9 @@ extern SerialScreenData_t g_screen_data;
 
 // 信号处理任务：采样、FFT、谐波识别和显示数据整理都在这里完成。
 void Task_Signal_Processing(void);
+// 请求刷新一次静态波形；wave_mode 取 1 或 3。
+// 串口屏触摸回调只需调用本接口，真正的 ADC/FFT 处理仍在主循环完成。
+void Task_RequestWaveRefresh(uint8_t wave_mode);
 // 串口显示发送入口，当前先保留接口，后续由协议层实现。
 void SerialScreen_Render_Task(const SerialScreenData_t *data);
 // 串口命令入口，用来切换显示模式等简单控制项。

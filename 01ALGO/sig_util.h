@@ -13,5 +13,12 @@ float SIG_Calculate_Vpp(const uint32_t *dma_buf, float linear_gain);
 int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg);
 // 把采样点重采样成适合屏幕显示的波形像素值。
 void SIG_CubicSpline_Resample(const float *in_pts, uint16_t in_len, uint16_t *out_pixels, uint16_t out_len);
+// 从浮点起点开始，按精确的采样跨度重采样；用于严格显示 1 个或 3 个周期。
+void SIG_CubicSpline_ResampleWindow(const float *in_pts,
+                                    uint16_t in_len,
+                                    float start_pos,
+                                    float span_samples,
+                                    uint16_t *out_pixels,
+                                    uint16_t out_len);
 
 #endif /* __SIG_UTIL_H */
