@@ -32,7 +32,7 @@ void app_loop(void)
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
+{   
     // 外部按键或控制信号可从这里接入。
     (void)GPIO_Pin;
 }

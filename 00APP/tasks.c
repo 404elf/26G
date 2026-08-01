@@ -37,19 +37,13 @@ static const float32_t TASK_BASE_MIN_AMP_V = 0.003f;
 static const float32_t TASK_FREQ_GRID_HZ = 500.0f;
 static const float32_t TASK_BASE_MIN_FREQ_HZ = 10000.0f;
 static const float32_t TASK_BASE_MAX_FREQ_HZ = 250000.0f;
-static const float32_t TASK_VPP_LOW_FREQ_BOUNDARY_HZ = 50000.0f;
-static const float32_t TASK_VPP_THREE_COMPONENT_HIGH_HZ = 120000.0f;
+static const float32_t TASK_VPP_HIGH_FREQ_SWITCH_HZ = 200000.0f;
 static const float32_t TASK_COMPONENT_MAX_FREQ_HZ = 500000.0f;
 static const float32_t TASK_FREQ_EDGE_TOLERANCE_HZ = 250.0f;
 static const float32_t TASK_HARMONIC_FREQ_TOLERANCE_HZ = TASK_FREQ_GRID_HZ;
 static const float32_t TASK_INTERFERENCE_CENTER_HZ = 1000000.0f;
 static const float32_t TASK_INTERFERENCE_SEARCH_HALF_HZ = 10000.0f;
 static const float32_t TASK_INTERFERENCE_MIN_AMP_V = 0.001f;
-static const float32_t TASK_OLS_MAX_RESIDUAL_V = 0.0045f;
-static const float32_t TASK_OLS_MAX_RESIDUAL_RATIO = 0.12f;
-static const float32_t TASK_OLS_MAX_AMP_ERROR_RATIO = 0.02f;
-static const float32_t TASK_OLS_MIN_PIVOT_RATIO = 0.10f;
-static const float32_t TASK_OLS_MIN_BACKUP_DROP_MV = 5.0f;
 
 #define TASK_DECISION_CONFIRM_FRAMES 3U
 #define TASK_DECISION_MAX_AUTO_RETRIES 8U
@@ -170,19 +164,8 @@ static float32_t Task_GetOlsVppCorrection(float32_t base_freq_hz,
 
 static uint8_t Task_GetVppDecisionRegion(float32_t base_freq_hz, uint8_t component_count)
 {
-	if (component_count <= 1U) {
-		return 0U;
-	}
-	if (component_count == 2U) {
-		return (base_freq_hz < TASK_VPP_LOW_FREQ_BOUNDARY_HZ) ? 1U : 2U;
-	}
-	if (base_freq_hz < TASK_VPP_LOW_FREQ_BOUNDARY_HZ) {
-		return 3U;
-	}
-	if (base_freq_hz < TASK_VPP_THREE_COMPONENT_HIGH_HZ) {
-		return 4U;
-	}
-	return 5U;
+	(void)component_count;
+	return (base_freq_hz < TASK_VPP_HIGH_FREQ_SWITCH_HZ) ? 0U : 1U;
 }
 
 static uint32_t Task_BuildDecisionSignature(const SerialScreenData_t *data,
@@ -600,21 +583,10 @@ void Task_Signal_Processing(void)
 	g_vpp_debug.cycle_trim20_mv = cycle_set.trim20_v * 1000.0f;
 	g_vpp_debug.cycle_trim30_mv = cycle_set.trim30_v * 1000.0f;
 	g_vpp_debug.cycle_auto_mv = cycle_set.auto_v * 1000.0f;
-	// 保底值按有效分量数和频段选取；这些分界来自现场实测数据。
-	if (h_count <= 1U) {
-		// 纯正弦的 Vpp 只由基波峰值决定，不需要相位。
-		g_working_screen_data.Vpp_val = 2.0f * g_working_screen_data.harmonic_amp[0];
-	} else if (h_count == 2U) {
-		g_working_screen_data.Vpp_val = (f1 < TASK_VPP_LOW_FREQ_BOUNDARY_HZ)
-		                                ? g_vpp_debug.rank141_mv
-		                                : g_vpp_debug.rank3_mv;
-	} else if (f1 < TASK_VPP_LOW_FREQ_BOUNDARY_HZ) {
-		g_working_screen_data.Vpp_val = g_vpp_debug.rank101_mv;
-	} else if (f1 < TASK_VPP_THREE_COMPONENT_HIGH_HZ) {
-		g_working_screen_data.Vpp_val = g_vpp_debug.avg81_160_mv;
-	} else {
-		g_working_screen_data.Vpp_val = g_vpp_debug.cycle_auto_mv;
-	}
+	// 历史实测方案：低频用 rank101，高频用 rank3，不再按谐波数量分支。
+	g_working_screen_data.Vpp_val = (f1 < TASK_VPP_HIGH_FREQ_SWITCH_HZ)
+	                                ? g_vpp_debug.rank101_mv
+	                                : g_vpp_debug.rank3_mv;
 	// 先保存现场验证过的结果；拟合不可信时继续使用它。
 	float32_t backup_vpp_mv = g_working_screen_data.Vpp_val;
 	g_vpp_debug.backup_mv = backup_vpp_mv;
@@ -690,23 +662,9 @@ void Task_Signal_Processing(void)
 		g_vpp_debug.ols_pivot_ratio = fit_result.pivot_ratio;
 		g_vpp_debug.ols_interference_mv = fit_result.interference_amp_v * 1000.0f;
 
-		float32_t correction_gain = Task_GetOlsVppCorrection(
-		    f1, h_count, (interference_freq_hz > 0.0f) ? 1U : 0U);
-		float32_t corrected_vpp_mv = fit_result.model_vpp_v * 1000.0f * correction_gain;
-		uint8_t fit_is_trusted =
-		    (fit_result.model_vpp_v > 0.0f &&
-		     fit_result.residual_rms_v <= TASK_OLS_MAX_RESIDUAL_V &&
-		     fit_result.residual_ratio <= TASK_OLS_MAX_RESIDUAL_RATIO &&
-		     max_amp_error_ratio <= TASK_OLS_MAX_AMP_ERROR_RATIO &&
-		     fit_result.pivot_ratio >= TASK_OLS_MIN_PIVOT_RATIO) ? 1U : 0U;
-		// 旧值已经接近时不动；只有明确偏大才采用修正后的 OLS。
-		if (fit_is_trusted &&
-		    corrected_vpp_mv <= (backup_vpp_mv - TASK_OLS_MIN_BACKUP_DROP_MV)) {
-			g_working_screen_data.Vpp_val = corrected_vpp_mv;
-			g_vpp_debug.ols_used = 1U;
-		} else {
-			g_working_screen_data.Vpp_val = backup_vpp_mv;
-		}
+		// OLS 只保留给波形重构和相位诊断，正式 Vpp 固定使用实测 rank 分段方案。
+		g_working_screen_data.Vpp_val = backup_vpp_mv;
+		g_vpp_debug.ols_used = 0U;
 
 		for (uint8_t component = 0U; component < h_count; component++) {
 			g_rel_phase_deg[component] =
