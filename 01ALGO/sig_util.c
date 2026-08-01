@@ -528,3 +528,293 @@ uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
 
     return 1U;
 }
+
+#define SIG_OLS_MAX_TONES 4U
+#define SIG_OLS_MAX_PARAMS 9U
+#define SIG_OLS_PIVOT_MIN 1e-6f
+#define SIG_OLS_RENORMALIZE_MASK 0xFFU
+
+// 规格很小，静态存放可避免在任务栈上放 9x10 矩阵。
+static float32_t g_sig_ols_aug[SIG_OLS_MAX_PARAMS][SIG_OLS_MAX_PARAMS + 1U];
+
+static uint8_t SIG_IsUsableFloat(float32_t value)
+{
+    return ((value == value) && (fabsf(value) < 1e20f)) ? 1U : 0U;
+}
+
+// 带部分主元的高斯消元，直接解方程，不显式求逆。
+static uint8_t SIG_SolveOlsSystem(uint8_t size, float32_t *solution, float32_t *out_pivot_ratio)
+{
+    float32_t min_pivot = 1e20f;
+    float32_t max_pivot = 0.0f;
+
+    if (solution == NULL || out_pivot_ratio == NULL || size == 0U || size > SIG_OLS_MAX_PARAMS) {
+        return 0U;
+    }
+
+    for (uint8_t column = 0U; column < size; column++) {
+        uint8_t pivot_row = column;
+        float32_t pivot_abs = fabsf(g_sig_ols_aug[column][column]);
+        for (uint8_t row = (uint8_t)(column + 1U); row < size; row++) {
+            float32_t candidate_abs = fabsf(g_sig_ols_aug[row][column]);
+            if (candidate_abs > pivot_abs) {
+                pivot_abs = candidate_abs;
+                pivot_row = row;
+            }
+        }
+        if (!SIG_IsUsableFloat(pivot_abs) || pivot_abs < SIG_OLS_PIVOT_MIN) {
+            return 0U;
+        }
+
+        if (pivot_row != column) {
+            for (uint8_t item = column; item <= size; item++) {
+                float32_t temp = g_sig_ols_aug[column][item];
+                g_sig_ols_aug[column][item] = g_sig_ols_aug[pivot_row][item];
+                g_sig_ols_aug[pivot_row][item] = temp;
+            }
+        }
+
+        if (pivot_abs < min_pivot) { min_pivot = pivot_abs; }
+        if (pivot_abs > max_pivot) { max_pivot = pivot_abs; }
+
+        float32_t pivot = g_sig_ols_aug[column][column];
+        for (uint8_t row = (uint8_t)(column + 1U); row < size; row++) {
+            float32_t factor = g_sig_ols_aug[row][column] / pivot;
+            g_sig_ols_aug[row][column] = 0.0f;
+            for (uint8_t item = (uint8_t)(column + 1U); item <= size; item++) {
+                g_sig_ols_aug[row][item] -= factor * g_sig_ols_aug[column][item];
+            }
+        }
+    }
+
+    for (int row = (int)size - 1; row >= 0; row--) {
+        float32_t value = g_sig_ols_aug[row][size];
+        for (uint8_t column = (uint8_t)(row + 1); column < size; column++) {
+            value -= g_sig_ols_aug[row][column] * solution[column];
+        }
+        float32_t pivot = g_sig_ols_aug[row][row];
+        if (fabsf(pivot) < SIG_OLS_PIVOT_MIN) {
+            return 0U;
+        }
+        solution[row] = value / pivot;
+        if (!SIG_IsUsableFloat(solution[row])) {
+            return 0U;
+        }
+    }
+
+    *out_pivot_ratio = (max_pivot > 0.0f) ? (min_pivot / max_pivot) : 0.0f;
+    return 1U;
+}
+
+static void SIG_AdvanceOlsOscillators(float32_t *osc_cos,
+                                      float32_t *osc_sin,
+                                      const float32_t *step_cos,
+                                      const float32_t *step_sin,
+                                      uint8_t tone_count,
+                                      uint16_t sample_index)
+{
+    for (uint8_t tone = 0U; tone < tone_count; tone++) {
+        float32_t old_cos = osc_cos[tone];
+        float32_t next_cos = old_cos * step_cos[tone] - osc_sin[tone] * step_sin[tone];
+        osc_sin[tone] = osc_sin[tone] * step_cos[tone] + old_cos * step_sin[tone];
+        osc_cos[tone] = next_cos;
+
+        // 长帧递推会积累舍入误差，定期拉回单位圆。
+        if ((sample_index & SIG_OLS_RENORMALIZE_MASK) == SIG_OLS_RENORMALIZE_MASK) {
+            float32_t norm = sqrtf(osc_cos[tone] * osc_cos[tone] + osc_sin[tone] * osc_sin[tone]);
+            if (norm > 0.0f) {
+                osc_cos[tone] /= norm;
+                osc_sin[tone] /= norm;
+            }
+        }
+    }
+}
+
+uint8_t SIG_ReconstructHarmonicWaveOLS(const float *time_domain,
+                                       uint16_t sample_count,
+                                       float sample_rate_hz,
+                                       const float *component_freq_hz,
+                                       uint8_t component_count,
+                                       float interference_freq_hz,
+                                       uint8_t period_count,
+                                       uint16_t *out_pixels,
+                                       uint16_t out_len,
+                                       SIG_HarmonicFitResult_t *out_fit)
+{
+    const float32_t two_pi = 6.28318530717958647692f;
+    // 单任务调用，工作数组放 BSS，给中断栈留足余量。
+    static float32_t tone_freq_hz[SIG_OLS_MAX_TONES];
+    static float32_t step_cos[SIG_OLS_MAX_TONES];
+    static float32_t step_sin[SIG_OLS_MAX_TONES];
+    static float32_t osc_cos[SIG_OLS_MAX_TONES];
+    static float32_t osc_sin[SIG_OLS_MAX_TONES];
+    static float32_t basis[SIG_OLS_MAX_PARAMS];
+    static float32_t solution[SIG_OLS_MAX_PARAMS];
+    uint8_t has_interference = (interference_freq_hz > 0.0f) ? 1U : 0U;
+    uint8_t tone_count = (uint8_t)(component_count + has_interference);
+    uint8_t parameter_count = (uint8_t)(1U + 2U * tone_count);
+
+    if (out_fit != NULL) {
+        out_fit->model_vpp_v = 0.0f;
+        out_fit->residual_rms_v = 0.0f;
+        out_fit->residual_ratio = 0.0f;
+        out_fit->pivot_ratio = 0.0f;
+        out_fit->interference_amp_v = 0.0f;
+        for (uint8_t component = 0U; component < 4U; component++) {
+            out_fit->component_amp_v[component] = 0.0f;
+            out_fit->relative_phase_rad[component] = 0.0f;
+        }
+    }
+
+    if (time_domain == NULL || component_freq_hz == NULL || out_pixels == NULL || out_fit == NULL ||
+        sample_count < 2U || out_len == 0U || component_count == 0U ||
+        tone_count > SIG_OLS_MAX_TONES || parameter_count > SIG_OLS_MAX_PARAMS ||
+        sample_rate_hz <= 0.0f || component_freq_hz[0] <= 0.0f) {
+        return 0U;
+    }
+
+    for (uint8_t tone = 0U; tone < component_count; tone++) {
+        tone_freq_hz[tone] = component_freq_hz[tone];
+    }
+    if (has_interference) {
+        tone_freq_hz[component_count] = interference_freq_hz;
+    }
+    for (uint8_t tone = 0U; tone < tone_count; tone++) {
+        if (tone_freq_hz[tone] <= 0.0f || tone_freq_hz[tone] >= 0.5f * sample_rate_hz) {
+            return 0U;
+        }
+        float32_t step = two_pi * tone_freq_hz[tone] / sample_rate_hz;
+        step_cos[tone] = arm_cos_f32(step);
+        step_sin[tone] = arm_sin_f32(step);
+        osc_cos[tone] = 1.0f;
+        osc_sin[tone] = 0.0f;
+    }
+
+    for (uint8_t row = 0U; row < parameter_count; row++) {
+        for (uint8_t column = 0U; column <= parameter_count; column++) {
+            g_sig_ols_aug[row][column] = 0.0f;
+        }
+    }
+
+    float32_t signal_square_sum = 0.0f;
+    for (uint16_t sample = 0U; sample < sample_count; sample++) {
+        basis[0] = 1.0f;
+        for (uint8_t tone = 0U; tone < tone_count; tone++) {
+            basis[1U + 2U * tone] = osc_cos[tone];
+            basis[2U + 2U * tone] = osc_sin[tone];
+        }
+
+        float32_t measured = time_domain[sample];
+        signal_square_sum += measured * measured;
+        for (uint8_t row = 0U; row < parameter_count; row++) {
+            for (uint8_t column = row; column < parameter_count; column++) {
+                g_sig_ols_aug[row][column] += basis[row] * basis[column];
+            }
+            g_sig_ols_aug[row][parameter_count] += basis[row] * measured;
+        }
+        SIG_AdvanceOlsOscillators(osc_cos, osc_sin, step_cos, step_sin, tone_count, sample);
+    }
+
+    float32_t inverse_count = 1.0f / (float32_t)sample_count;
+    for (uint8_t row = 0U; row < parameter_count; row++) {
+        for (uint8_t column = row; column < parameter_count; column++) {
+            g_sig_ols_aug[row][column] *= inverse_count;
+            g_sig_ols_aug[column][row] = g_sig_ols_aug[row][column];
+        }
+        g_sig_ols_aug[row][parameter_count] *= inverse_count;
+    }
+
+    if (!SIG_SolveOlsSystem(parameter_count, solution, &out_fit->pivot_ratio)) {
+        return 0U;
+    }
+
+    static float32_t raw_phase[4];
+    for (uint8_t component = 0U; component < component_count; component++) {
+        float32_t cosine_coefficient = solution[1U + 2U * component];
+        float32_t sine_coefficient = solution[2U + 2U * component];
+        out_fit->component_amp_v[component] =
+            sqrtf(cosine_coefficient * cosine_coefficient + sine_coefficient * sine_coefficient);
+        raw_phase[component] = atan2f(-sine_coefficient, cosine_coefficient);
+    }
+    if (has_interference) {
+        uint8_t tone = component_count;
+        float32_t cosine_coefficient = solution[1U + 2U * tone];
+        float32_t sine_coefficient = solution[2U + 2U * tone];
+        out_fit->interference_amp_v =
+            sqrtf(cosine_coefficient * cosine_coefficient + sine_coefficient * sine_coefficient);
+    }
+
+    out_fit->relative_phase_rad[0] = 0.0f;
+    for (uint8_t component = 1U; component < component_count; component++) {
+        uint32_t order = (uint32_t)(component_freq_hz[component] / component_freq_hz[0] + 0.5f);
+        if (order < 2U) {
+            return 0U;
+        }
+        float32_t phase = raw_phase[component] - (float32_t)order * raw_phase[0];
+        while (phase > 3.14159265358979323846f) { phase -= two_pi; }
+        while (phase < -3.14159265358979323846f) { phase += two_pi; }
+        out_fit->relative_phase_rad[component] = phase;
+    }
+
+    for (uint8_t tone = 0U; tone < tone_count; tone++) {
+        osc_cos[tone] = 1.0f;
+        osc_sin[tone] = 0.0f;
+    }
+    float32_t residual_square_sum = 0.0f;
+    for (uint16_t sample = 0U; sample < sample_count; sample++) {
+        float32_t estimated = solution[0];
+        for (uint8_t tone = 0U; tone < tone_count; tone++) {
+            estimated += solution[1U + 2U * tone] * osc_cos[tone] +
+                         solution[2U + 2U * tone] * osc_sin[tone];
+        }
+        float32_t residual = time_domain[sample] - estimated;
+        residual_square_sum += residual * residual;
+        SIG_AdvanceOlsOscillators(osc_cos, osc_sin, step_cos, step_sin, tone_count, sample);
+    }
+
+    out_fit->residual_rms_v = sqrtf(residual_square_sum * inverse_count);
+    float32_t signal_rms_v = sqrtf(signal_square_sum * inverse_count);
+    out_fit->residual_ratio = (signal_rms_v > 1e-9f)
+                              ? (out_fit->residual_rms_v / signal_rms_v)
+                              : 1.0f;
+    out_fit->model_vpp_v = SIG_CalculateModelVpp(component_freq_hz,
+                                                  out_fit->component_amp_v,
+                                                  out_fit->relative_phase_rad,
+                                                  component_count);
+
+    uint8_t periods = (period_count == 3U) ? 3U : 1U;
+    float32_t max_abs = 0.0f;
+    for (uint16_t out_index = 0U; out_index < out_len; out_index++) {
+        float32_t fraction = (out_len == 1U) ? 0.0f : (float32_t)out_index / (float32_t)(out_len - 1U);
+        float32_t base_angle = two_pi * (float32_t)periods * fraction;
+        float32_t value = 0.0f;
+        for (uint8_t component = 0U; component < component_count; component++) {
+            uint32_t order = (uint32_t)(component_freq_hz[component] / component_freq_hz[0] + 0.5f);
+            value += out_fit->component_amp_v[component] *
+                     arm_cos_f32((float32_t)order * base_angle + out_fit->relative_phase_rad[component]);
+        }
+        float32_t abs_value = fabsf(value);
+        if (abs_value > max_abs) { max_abs = abs_value; }
+    }
+
+    if (max_abs < 1e-9f) {
+        for (uint16_t out_index = 0U; out_index < out_len; out_index++) { out_pixels[out_index] = 120U; }
+        return 1U;
+    }
+
+    for (uint16_t out_index = 0U; out_index < out_len; out_index++) {
+        float32_t fraction = (out_len == 1U) ? 0.0f : (float32_t)out_index / (float32_t)(out_len - 1U);
+        float32_t base_angle = two_pi * (float32_t)periods * fraction;
+        float32_t value = 0.0f;
+        for (uint8_t component = 0U; component < component_count; component++) {
+            uint32_t order = (uint32_t)(component_freq_hz[component] / component_freq_hz[0] + 0.5f);
+            value += out_fit->component_amp_v[component] *
+                     arm_cos_f32((float32_t)order * base_angle + out_fit->relative_phase_rad[component]);
+        }
+        float32_t pixel = 120.0f - (value / max_abs) * 100.0f;
+        pixel = SIG_ClampFloat(pixel, 20.0f, 220.0f);
+        out_pixels[out_index] = (uint16_t)(pixel + 0.5f);
+    }
+
+    return 1U;
+}

@@ -27,6 +27,7 @@ SerialScreenData_t g_screen_data __attribute__((section(".iram1")));
 
 // 保留全部候选供监视窗口比较，正式显示按频段选取。
 volatile TaskVppDebug_t g_vpp_debug = { 0 };
+volatile TaskOlsDebug_t g_ols_debug = { 0 };
 volatile float g_rel_phase_deg[4] = { 0.0f };
 
 // 测量边界与抗噪门限，单位见变量名。
@@ -41,7 +42,18 @@ static const float32_t TASK_VPP_THREE_COMPONENT_HIGH_HZ = 120000.0f;
 static const float32_t TASK_COMPONENT_MAX_FREQ_HZ = 500000.0f;
 static const float32_t TASK_FREQ_EDGE_TOLERANCE_HZ = 250.0f;
 static const float32_t TASK_HARMONIC_FREQ_TOLERANCE_HZ = TASK_FREQ_GRID_HZ;
+static const float32_t TASK_INTERFERENCE_CENTER_HZ = 1000000.0f;
+static const float32_t TASK_INTERFERENCE_SEARCH_HALF_HZ = 10000.0f;
+static const float32_t TASK_INTERFERENCE_MIN_AMP_V = 0.001f;
+static const float32_t TASK_OLS_MAX_RESIDUAL_V = 0.0045f;
+static const float32_t TASK_OLS_MAX_RESIDUAL_RATIO = 0.12f;
+static const float32_t TASK_OLS_MAX_AMP_ERROR_RATIO = 0.02f;
+static const float32_t TASK_OLS_MIN_PIVOT_RATIO = 0.10f;
+static const float32_t TASK_OLS_MIN_BACKUP_DROP_MV = 5.0f;
 
+#define TASK_DECISION_CONFIRM_FRAMES 3U
+#define TASK_DECISION_MAX_AUTO_RETRIES 8U
+#define TASK_DECISION_OLS_BIT (1UL << 4)
 #define TASK_SPECTRAL_CANDIDATE_MAX 12U
 
 typedef struct {
@@ -66,6 +78,13 @@ static uint8_t g_hmi_rx_byte = 0U;
 static volatile uint8_t g_hmi_addt_ready = 0U;
 static volatile uint8_t g_hmi_addt_finished = 0U;
 static uint8_t g_hmi_wave_tx[HMI_WAVE_TX_POINTS] __attribute__((section(".iram1")));
+
+// 发布判定防抖；只约束模式切换，不改本帧测量结果。
+static uint32_t g_stable_decision_signature = 0U;
+static uint32_t g_pending_decision_signature = 0U;
+static uint8_t g_stable_decision_valid = 0U;
+static uint8_t g_pending_decision_count = 0U;
+static volatile uint8_t g_decision_retry_count = 0U;
 
 static void HMISendString(const char *str);
 static HAL_StatusTypeDef HMI_SendCurveBytes(uint16_t point_count);
@@ -120,6 +139,115 @@ static float32_t Task_SnapFrequencyToGrid(float32_t freq_hz)
 		return 0.0f;
 	}
 	return floorf(freq_hz / TASK_FREQ_GRID_HZ + 0.5f) * TASK_FREQ_GRID_HZ;
+}
+
+// 系数按现有现场数据取误差带上沿，避免过度追零。
+static float32_t Task_GetOlsVppCorrection(float32_t base_freq_hz,
+                                          uint8_t component_count,
+                                          uint8_t has_interference)
+{
+	if (component_count <= 1U) {
+		return 1.0f;
+	}
+	if (has_interference) {
+		return 0.872f;
+	}
+	if (component_count == 2U) {
+		return 0.985f;
+	}
+
+	if (base_freq_hz <= 60000.0f) {
+		return 0.960f;
+	}
+	if (base_freq_hz < 120000.0f) {
+		return 0.960f - (base_freq_hz - 60000.0f) * (0.030f / 60000.0f);
+	}
+	if (base_freq_hz < 160000.0f) {
+		return 0.930f - (base_freq_hz - 120000.0f) * (0.065f / 40000.0f);
+	}
+	return 0.865f;
+}
+
+static uint8_t Task_GetVppDecisionRegion(float32_t base_freq_hz, uint8_t component_count)
+{
+	if (component_count <= 1U) {
+		return 0U;
+	}
+	if (component_count == 2U) {
+		return (base_freq_hz < TASK_VPP_LOW_FREQ_BOUNDARY_HZ) ? 1U : 2U;
+	}
+	if (base_freq_hz < TASK_VPP_LOW_FREQ_BOUNDARY_HZ) {
+		return 3U;
+	}
+	if (base_freq_hz < TASK_VPP_THREE_COMPONENT_HIGH_HZ) {
+		return 4U;
+	}
+	return 5U;
+}
+
+static uint32_t Task_BuildDecisionSignature(const SerialScreenData_t *data,
+                                            float32_t base_freq_hz,
+                                            uint8_t component_count,
+                                            uint8_t has_interference,
+                                            uint8_t use_ols)
+{
+	uint32_t signature = (uint32_t)Task_GetVppDecisionRegion(base_freq_hz, component_count);
+	if (has_interference) {
+		signature |= (1UL << 3);
+	}
+	if (use_ols) {
+		signature |= TASK_DECISION_OLS_BIT;
+	}
+
+	// 基频档位和谐波阶数都参与确认，防止相邻判定来回切换。
+	uint32_t base_grid = (uint32_t)(base_freq_hz / TASK_FREQ_GRID_HZ + 0.5f);
+	if (base_grid > 0x1FFU) {
+		base_grid = 0x1FFU;
+	}
+	signature |= base_grid << 17U;
+
+	if (data != NULL && base_freq_hz > 0.0f) {
+		for (uint8_t component = 1U; component < component_count && component < 3U; component++) {
+			uint32_t order = (uint32_t)(data->harmonic_freq[component] * 1000.0f /
+			                            base_freq_hz + 0.5f);
+			if (order > 0x3FU) {
+				order = 0x3FU;
+			}
+			signature |= order << (5U + (uint32_t)(component - 1U) * 6U);
+		}
+	}
+	return signature;
+}
+
+static uint8_t Task_ConfirmDecision(uint32_t candidate_signature)
+{
+	if (g_stable_decision_valid == 0U) {
+		g_stable_decision_signature = candidate_signature;
+		g_pending_decision_signature = candidate_signature;
+		g_pending_decision_count = 0U;
+		g_stable_decision_valid = 1U;
+		return 1U;
+	}
+
+	if (candidate_signature == g_stable_decision_signature) {
+		g_pending_decision_signature = candidate_signature;
+		g_pending_decision_count = 0U;
+		return 1U;
+	}
+
+	if (candidate_signature != g_pending_decision_signature) {
+		g_pending_decision_signature = candidate_signature;
+		g_pending_decision_count = 1U;
+	} else if (g_pending_decision_count < 0xFFU) {
+		g_pending_decision_count++;
+	}
+
+	if (g_pending_decision_count >= TASK_DECISION_CONFIRM_FRAMES) {
+		g_stable_decision_signature = candidate_signature;
+		g_pending_decision_count = 0U;
+		return 1U;
+	}
+	return 0U;
 }
 
 static void Task_InsertSpectralCandidate(Task_SpectralCandidate_t *candidates,
@@ -262,23 +390,37 @@ static int Task_FindFundamentalBin(float32_t linear_gain)
 		}
 	}
 
-	// 没有“基波 + 谐波”关系就拒绝本帧，别拿干扰峰当基波。
-	if (best_index < 0 || best_match_count < 2U) {
-		return -1;
+	if (best_index >= 0 && best_match_count >= 2U) {
+		return candidates[best_index].bin;
 	}
-	return candidates[best_index].bin;
+
+	// 纯基波没有谐波族；此时只在题设基带内接受最强单峰。
+	int strongest_base_index = -1;
+	for (uint8_t i = 0U; i < candidate_count; i++) {
+		if (candidates[i].freq_hz < TASK_BASE_MIN_FREQ_HZ ||
+		    candidates[i].freq_hz > TASK_BASE_MAX_FREQ_HZ) {
+			continue;
+		}
+		if (strongest_base_index < 0 ||
+		    candidates[i].amp_v > candidates[strongest_base_index].amp_v) {
+			strongest_base_index = (int)i;
+		}
+	}
+	return (strongest_base_index >= 0) ? candidates[strongest_base_index].bin : -1;
 }
 
 void Task_RequestWaveRefresh(uint8_t wave_mode)
 {
 	g_requested_wave_mode = (wave_mode == 3U) ? 3U : 1U;
 	g_requested_view = HMI_VIEW_WAVEFORM;
+	g_decision_retry_count = 0U;
 	g_wave_refresh_pending = 1U;
 }
 
 void Task_RequestSpectrumRefresh(void)
 {
 	g_requested_view = HMI_VIEW_SPECTRUM;
+	g_decision_retry_count = 0U;
 	g_wave_refresh_pending = 1U;
 }
 
@@ -473,14 +615,22 @@ void Task_Signal_Processing(void)
 	} else {
 		g_working_screen_data.Vpp_val = g_vpp_debug.cycle_auto_mv;
 	}
+	// 先保存现场验证过的结果；拟合不可信时继续使用它。
+	float32_t backup_vpp_mv = g_working_screen_data.Vpp_val;
+	g_vpp_debug.backup_mv = backup_vpp_mv;
 	g_vpp_debug.model_mv = 0.0f;
+	g_vpp_debug.ols_residual_mv = 0.0f;
+	g_vpp_debug.ols_residual_pct = 0.0f;
+	g_vpp_debug.ols_amp_error_pct = 0.0f;
+	g_vpp_debug.ols_pivot_ratio = 0.0f;
+	g_vpp_debug.ols_interference_mv = 0.0f;
+	g_vpp_debug.ols_used = 0U;
 	for (uint8_t component = 0U; component < 4U; component++) {
 		g_rel_phase_deg[component] = 0.0f;
 	}
 
-	// 相位投影用实测 f1 的整数倍；吸附频率只负责对外显示。
+	// 拟合频率用实测 f1 的整数倍；吸附频率只负责对外显示。
 	float32_t phase_freq_hz[4] = { 0.0f };
-	float32_t relative_phase_rad[4] = { 0.0f };
 	for (uint8_t component = 0U; component < h_count; component++) {
 		float32_t display_freq_hz = g_working_screen_data.harmonic_freq[component] * 1000.0f;
 		uint32_t order = (uint32_t)(display_freq_hz / f1 + 0.5f);
@@ -490,26 +640,146 @@ void Task_Signal_Processing(void)
 		phase_freq_hz[component] = f1_measured * (float32_t)order;
 	}
 
-	float32_t model_vpp_mv = 0.0f;
-	if (!SIG_ReconstructHarmonicWave(rfft_time_domain,
-	                                 FFT_LENGTH,
-	                                 FFT_SAMPLE_RATE_HZ,
-	                                 phase_freq_hz,
-	                                 g_working_screen_data.harmonic_amp,
-	                                 h_count,
-	                                 requested_wave_mode,
-	                                 g_working_screen_data.wave_pixels,
-	                                 HMI_WAVE_SOURCE_POINTS,
-	                                 &model_vpp_mv,
-	                                 relative_phase_rad)) {
+	// 第三问的 1 MHz 信号只作为干扰基函数，不参与输出波形。
+	float32_t interference_freq_hz = 0.0f;
+	float32_t detected_interference_amp_v = 0.0f;
+	int interference_bin = (int)(TASK_INTERFERENCE_CENTER_HZ / FFT_BIN_WIDTH_HZ + 0.5f);
+	int interference_peak_bin = FFT_Find_Local_Max_Bin(rfft_mag,
+	                                                   interference_bin - 4,
+	                                                   interference_bin + 4);
+	if (interference_peak_bin > 0) {
+		float32_t detected_freq_hz = 0.0f;
+		FFT_Rife_Interpolate(interference_peak_bin,
+		                     &detected_freq_hz,
+		                     &detected_interference_amp_v,
+		                     gain_snapshot);
+		if (detected_interference_amp_v >= TASK_INTERFERENCE_MIN_AMP_V &&
+		    fabsf(detected_freq_hz - TASK_INTERFERENCE_CENTER_HZ) <= TASK_INTERFERENCE_SEARCH_HALF_HZ) {
+			interference_freq_hz = detected_freq_hz;
+		}
+	}
+
+	SIG_HarmonicFitResult_t fit_result;
+	uint8_t fit_solved = SIG_ReconstructHarmonicWaveOLS(rfft_time_domain,
+	                                                    FFT_LENGTH,
+	                                                    FFT_SAMPLE_RATE_HZ,
+	                                                    phase_freq_hz,
+	                                                    h_count,
+	                                                    interference_freq_hz,
+	                                                    requested_wave_mode,
+	                                                    g_working_screen_data.wave_pixels,
+	                                                    HMI_WAVE_SOURCE_POINTS,
+	                                                    &fit_result);
+	if (fit_solved) {
+		float32_t max_amp_error_ratio = 0.0f;
+		for (uint8_t component = 0U; component < h_count; component++) {
+			float32_t reference_amp_v = g_working_screen_data.harmonic_amp[component] * 0.001f;
+			if (reference_amp_v > 0.001f) {
+				float32_t error_ratio =
+				    fabsf(fit_result.component_amp_v[component] - reference_amp_v) / reference_amp_v;
+				if (error_ratio > max_amp_error_ratio) {
+					max_amp_error_ratio = error_ratio;
+				}
+			}
+		}
+
+		g_vpp_debug.model_mv = fit_result.model_vpp_v * 1000.0f;
+		g_vpp_debug.ols_residual_mv = fit_result.residual_rms_v * 1000.0f;
+		g_vpp_debug.ols_residual_pct = fit_result.residual_ratio * 100.0f;
+		g_vpp_debug.ols_amp_error_pct = max_amp_error_ratio * 100.0f;
+		g_vpp_debug.ols_pivot_ratio = fit_result.pivot_ratio;
+		g_vpp_debug.ols_interference_mv = fit_result.interference_amp_v * 1000.0f;
+
+		float32_t correction_gain = Task_GetOlsVppCorrection(
+		    f1, h_count, (interference_freq_hz > 0.0f) ? 1U : 0U);
+		float32_t corrected_vpp_mv = fit_result.model_vpp_v * 1000.0f * correction_gain;
+		uint8_t fit_is_trusted =
+		    (fit_result.model_vpp_v > 0.0f &&
+		     fit_result.residual_rms_v <= TASK_OLS_MAX_RESIDUAL_V &&
+		     fit_result.residual_ratio <= TASK_OLS_MAX_RESIDUAL_RATIO &&
+		     max_amp_error_ratio <= TASK_OLS_MAX_AMP_ERROR_RATIO &&
+		     fit_result.pivot_ratio >= TASK_OLS_MIN_PIVOT_RATIO) ? 1U : 0U;
+		// 旧值已经接近时不动；只有明确偏大才采用修正后的 OLS。
+		if (fit_is_trusted &&
+		    corrected_vpp_mv <= (backup_vpp_mv - TASK_OLS_MIN_BACKUP_DROP_MV)) {
+			g_working_screen_data.Vpp_val = corrected_vpp_mv;
+			g_vpp_debug.ols_used = 1U;
+		} else {
+			g_working_screen_data.Vpp_val = backup_vpp_mv;
+		}
+
+		for (uint8_t component = 0U; component < h_count; component++) {
+			g_rel_phase_deg[component] =
+			    fit_result.relative_phase_rad[component] * 57.29577951308232f;
+		}
+	} else {
+		// 极少数病态帧仍可显示旧模型，但 Vpp 不离开保底方案。
+		float32_t old_model_vpp_mv = 0.0f;
+		float32_t old_relative_phase_rad[4] = { 0.0f };
+		if (!SIG_ReconstructHarmonicWave(rfft_time_domain,
+		                                 FFT_LENGTH,
+		                                 FFT_SAMPLE_RATE_HZ,
+		                                 phase_freq_hz,
+		                                 g_working_screen_data.harmonic_amp,
+		                                 h_count,
+		                                 requested_wave_mode,
+		                                 g_working_screen_data.wave_pixels,
+		                                 HMI_WAVE_SOURCE_POINTS,
+		                                 &old_model_vpp_mv,
+		                                 old_relative_phase_rad)) {
+			ADC_Measure_ReleaseFrame();
+			return;
+		}
+		g_vpp_debug.model_mv = old_model_vpp_mv;
+		g_working_screen_data.Vpp_val = backup_vpp_mv;
+		for (uint8_t component = 0U; component < h_count; component++) {
+			g_rel_phase_deg[component] =
+			    old_relative_phase_rad[component] * 57.29577951308232f;
+		}
+	}
+
+	uint8_t has_interference = (interference_freq_hz > 0.0f) ? 1U : 0U;
+	float32_t candidate_vpp_mv = g_working_screen_data.Vpp_val;
+	uint32_t candidate_signature = Task_BuildDecisionSignature(
+	    &g_working_screen_data, f1, h_count, has_interference, g_vpp_debug.ols_used);
+	uint8_t decision_accepted = Task_ConfirmDecision(candidate_signature);
+
+	// 精简结构同时显示候选和已发布状态，便于确认防抖是否生效。
+	g_ols_debug.solved = fit_solved;
+	g_ols_debug.used = decision_accepted
+	                   ? g_vpp_debug.ols_used
+	                   : ((g_stable_decision_signature & TASK_DECISION_OLS_BIT) ? 1U : 0U);
+	g_ols_debug.held = decision_accepted ? 0U : 1U;
+	g_ols_debug.confirm_count = g_pending_decision_count;
+	g_ols_debug.stable_signature = g_stable_decision_signature;
+	g_ols_debug.candidate_signature = candidate_signature;
+	g_ols_debug.display_mv = decision_accepted ? candidate_vpp_mv : g_screen_data.Vpp_val;
+	g_ols_debug.candidate_mv = candidate_vpp_mv;
+	g_ols_debug.backup_mv = backup_vpp_mv;
+	g_ols_debug.model_mv = fit_solved ? (fit_result.model_vpp_v * 1000.0f) : 0.0f;
+	g_ols_debug.correction_gain = fit_solved
+	                              ? Task_GetOlsVppCorrection(f1, h_count, has_interference)
+	                              : 1.0f;
+	g_ols_debug.corrected_mv = g_ols_debug.model_mv * g_ols_debug.correction_gain;
+	g_ols_debug.residual_mv = g_vpp_debug.ols_residual_mv;
+	g_ols_debug.residual_pct = g_vpp_debug.ols_residual_pct;
+	g_ols_debug.amp_error_pct = g_vpp_debug.ols_amp_error_pct;
+	g_ols_debug.pivot_ratio = g_vpp_debug.ols_pivot_ratio;
+	g_ols_debug.interference_mv = g_vpp_debug.ols_interference_mv;
+	g_ols_debug.interference_detected_mv = detected_interference_amp_v * 1000.0f;
+	g_ols_debug.phase2_deg = (fit_solved && h_count > 1U) ? g_rel_phase_deg[1] : 0.0f;
+	g_ols_debug.phase3_deg = (fit_solved && h_count > 2U) ? g_rel_phase_deg[2] : 0.0f;
+
+	if (!decision_accepted) {
+		// 一次按键在后台补采；始终不稳定时停止，旧画面不变。
+		if (g_decision_retry_count < TASK_DECISION_MAX_AUTO_RETRIES) {
+			g_decision_retry_count++;
+			g_wave_refresh_pending = 1U;
+		}
 		ADC_Measure_ReleaseFrame();
 		return;
 	}
-	g_vpp_debug.model_mv = model_vpp_mv;
-	for (uint8_t component = 0U; component < h_count; component++) {
-		g_rel_phase_deg[component] =
-		    relative_phase_rad[component] * 57.29577951308232f;
-	}
+	g_decision_retry_count = 0U;
 
 	// 频谱柱只表达已确认的分量。
 	Task_UpdateSpectrumBars(&g_working_screen_data, h_count);

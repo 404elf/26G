@@ -68,7 +68,18 @@ float SIG_Calculate_CycleVpp(const float *time_domain,
                              float linear_gain);
 // 查找带迟滞的上升过零点。
 int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg);
-// 从原始帧估相位并合成波形；模型 Vpp 与 component_amp 使用相同单位。
+// 联合最小二乘拟合结果；电压量统一使用 V。
+typedef struct {
+	float model_vpp_v;
+	float residual_rms_v;
+	float residual_ratio;
+	float pivot_ratio;
+	float component_amp_v[4];
+	float relative_phase_rad[4];
+	float interference_amp_v;
+} SIG_HarmonicFitResult_t;
+
+// 旧投影法仅作为拟合失败时的显示后备。
 uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
                                     uint16_t sample_count,
                                     float sample_rate_hz,
@@ -80,5 +91,17 @@ uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
                                     uint16_t out_len,
                                     float *out_model_vpp,
                                     float *out_relative_phase);
+
+// 同时拟合直流、基波、有效谐波和可选干扰，再由拟合模型重构波形。
+uint8_t SIG_ReconstructHarmonicWaveOLS(const float *time_domain,
+                                       uint16_t sample_count,
+                                       float sample_rate_hz,
+                                       const float *component_freq_hz,
+                                       uint8_t component_count,
+                                       float interference_freq_hz,
+                                       uint8_t period_count,
+                                       uint16_t *out_pixels,
+                                       uint16_t out_len,
+                                       SIG_HarmonicFitResult_t *out_fit);
 
 #endif /* __SIG_UTIL_H */

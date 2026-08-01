@@ -65,10 +65,42 @@ typedef struct {
 	float cycle_trim20_mv;
 	float cycle_trim30_mv;
 	float cycle_auto_mv;
+	float backup_mv;
 	float model_mv;
+	float ols_residual_mv;
+	float ols_residual_pct;
+	float ols_amp_error_pct;
+	float ols_pivot_ratio;
+	float ols_interference_mv;
+	uint8_t ols_used;
 } TaskVppDebug_t;
 
+// OLS 联调精简视图；不参与正式计算。
+typedef struct {
+	uint8_t solved;
+	uint8_t used;
+	uint8_t held;
+	uint8_t confirm_count;
+	uint32_t stable_signature;
+	uint32_t candidate_signature;
+	float display_mv;
+	float candidate_mv;
+	float backup_mv;
+	float model_mv;
+	float corrected_mv;
+	float correction_gain;
+	float residual_mv;
+	float residual_pct;
+	float amp_error_pct;
+	float pivot_ratio;
+	float interference_mv;
+	float interference_detected_mv;
+	float phase2_deg;
+	float phase3_deg;
+} TaskOlsDebug_t;
+
 extern volatile TaskVppDebug_t g_vpp_debug;
+extern volatile TaskOlsDebug_t g_ols_debug;
 extern volatile float g_rel_phase_deg[4];
 
 // 完成一次采样、频谱分析和显示数据更新。
