@@ -37,7 +37,7 @@ static const float32_t TASK_BASE_MIN_AMP_V = 0.003f;
 static const float32_t TASK_FREQ_GRID_HZ = 500.0f;
 static const float32_t TASK_BASE_MIN_FREQ_HZ = 10000.0f;
 static const float32_t TASK_BASE_MAX_FREQ_HZ = 250000.0f;
-static const float32_t TASK_VPP_HIGH_FREQ_SWITCH_HZ = 200000.0f;
+static const float32_t TASK_VPP_TWO_COMPONENT_SWITCH_HZ = 50000.0f;
 static const float32_t TASK_COMPONENT_MAX_FREQ_HZ = 500000.0f;
 static const float32_t TASK_FREQ_EDGE_TOLERANCE_HZ = 250.0f;
 static const float32_t TASK_HARMONIC_FREQ_TOLERANCE_HZ = TASK_FREQ_GRID_HZ;
@@ -45,6 +45,7 @@ static const float32_t TASK_INTERFERENCE_CENTER_HZ = 1000000.0f;
 static const float32_t TASK_INTERFERENCE_SEARCH_HALF_HZ = 10000.0f;
 static const float32_t TASK_INTERFERENCE_MIN_AMP_V = 0.001f;
 
+#define TASK_VPP_BATCH_FRAMES 5U
 #define TASK_DECISION_CONFIRM_FRAMES 3U
 #define TASK_DECISION_MAX_AUTO_RETRIES 8U
 #define TASK_DECISION_OLS_BIT (1UL << 4)
@@ -79,6 +80,12 @@ static uint32_t g_pending_decision_signature = 0U;
 static uint8_t g_stable_decision_valid = 0U;
 static uint8_t g_pending_decision_count = 0U;
 static volatile uint8_t g_decision_retry_count = 0U;
+
+// 每次按键单独收集 5 帧；发布后不把本轮结果带到下一次按键。
+static float32_t g_vpp_batch_mv[TASK_VPP_BATCH_FRAMES] = { 0.0f };
+static uint32_t g_vpp_batch_signature = 0U;
+static uint8_t g_vpp_batch_count = 0U;
+static volatile uint8_t g_vpp_batch_reset_pending = 0U;
 
 static void HMISendString(const char *str);
 static HAL_StatusTypeDef HMI_SendCurveBytes(uint16_t point_count);
@@ -164,8 +171,11 @@ static float32_t Task_GetOlsVppCorrection(float32_t base_freq_hz,
 
 static uint8_t Task_GetVppDecisionRegion(float32_t base_freq_hz, uint8_t component_count)
 {
-	(void)component_count;
-	return (base_freq_hz < TASK_VPP_HIGH_FREQ_SWITCH_HZ) ? 0U : 1U;
+	// 0: rank101；1: rank3。三分量优先抗毛刺，两分量再按周期数对应的频段分类。
+	if (component_count >= 3U || base_freq_hz < TASK_VPP_TWO_COMPONENT_SWITCH_HZ) {
+		return 0U;
+	}
+	return 1U;
 }
 
 static uint32_t Task_BuildDecisionSignature(const SerialScreenData_t *data,
@@ -231,6 +241,51 @@ static uint8_t Task_ConfirmDecision(uint32_t candidate_signature)
 		return 1U;
 	}
 	return 0U;
+}
+
+static void Task_ResetVppBatch(void)
+{
+	g_vpp_batch_signature = 0U;
+	g_vpp_batch_count = 0U;
+}
+
+static uint8_t Task_CollectVppBatch(float32_t candidate_mv,
+	                                uint32_t signature,
+	                                float32_t *average_mv)
+{
+	if (average_mv == NULL) {
+		return 0U;
+	}
+
+	if (g_vpp_batch_count >= TASK_VPP_BATCH_FRAMES ||
+	    (g_vpp_batch_count > 0U && signature != g_vpp_batch_signature)) {
+		Task_ResetVppBatch();
+	}
+	if (g_vpp_batch_count == 0U) {
+		g_vpp_batch_signature = signature;
+	}
+
+	g_vpp_batch_mv[g_vpp_batch_count++] = candidate_mv;
+	if (g_vpp_batch_count < TASK_VPP_BATCH_FRAMES) {
+		return 0U;
+	}
+
+	float32_t sorted[TASK_VPP_BATCH_FRAMES];
+	for (uint8_t i = 0U; i < TASK_VPP_BATCH_FRAMES; i++) {
+		sorted[i] = g_vpp_batch_mv[i];
+	}
+	for (uint8_t i = 1U; i < TASK_VPP_BATCH_FRAMES; i++) {
+		float32_t value = sorted[i];
+		uint8_t j = i;
+		while (j > 0U && sorted[j - 1U] > value) {
+			sorted[j] = sorted[j - 1U];
+			j--;
+		}
+		sorted[j] = value;
+	}
+
+	*average_mv = (sorted[1] + sorted[2] + sorted[3]) / 3.0f;
+	return 1U;
 }
 
 static void Task_InsertSpectralCandidate(Task_SpectralCandidate_t *candidates,
@@ -397,6 +452,7 @@ void Task_RequestWaveRefresh(uint8_t wave_mode)
 	g_requested_wave_mode = (wave_mode == 3U) ? 3U : 1U;
 	g_requested_view = HMI_VIEW_WAVEFORM;
 	g_decision_retry_count = 0U;
+	g_vpp_batch_reset_pending = 1U;
 	g_wave_refresh_pending = 1U;
 }
 
@@ -404,6 +460,7 @@ void Task_RequestSpectrumRefresh(void)
 {
 	g_requested_view = HMI_VIEW_SPECTRUM;
 	g_decision_retry_count = 0U;
+	g_vpp_batch_reset_pending = 1U;
 	g_wave_refresh_pending = 1U;
 }
 
@@ -423,6 +480,10 @@ void Task_Signal_Processing(void)
 	                       ? HMI_VIEW_SPECTRUM
 	                       : HMI_VIEW_WAVEFORM;
 	g_wave_refresh_pending = 0U;
+	if (g_vpp_batch_reset_pending != 0U) {
+		Task_ResetVppBatch();
+		g_vpp_batch_reset_pending = 0U;
+	}
 
 	// 采样
 	const float gain_snapshot = 1.0f;
@@ -583,8 +644,9 @@ void Task_Signal_Processing(void)
 	g_vpp_debug.cycle_trim20_mv = cycle_set.trim20_v * 1000.0f;
 	g_vpp_debug.cycle_trim30_mv = cycle_set.trim30_v * 1000.0f;
 	g_vpp_debug.cycle_auto_mv = cycle_set.auto_v * 1000.0f;
-	// 历史实测方案：低频用 rank101，高频用 rank3，不再按谐波数量分支。
-	g_working_screen_data.Vpp_val = (f1 < TASK_VPP_HIGH_FREQ_SWITCH_HZ)
+	// 实测分类：三分量或低频两分量用 rank101，其余两分量用 rank3。
+	uint8_t vpp_rank_region = Task_GetVppDecisionRegion(f1, h_count);
+	g_working_screen_data.Vpp_val = (vpp_rank_region == 0U)
 	                                ? g_vpp_debug.rank101_mv
 	                                : g_vpp_debug.rank3_mv;
 	// 先保存现场验证过的结果；拟合不可信时继续使用它。
@@ -738,6 +800,16 @@ void Task_Signal_Processing(void)
 		return;
 	}
 	g_decision_retry_count = 0U;
+	float32_t averaged_vpp_mv = 0.0f;
+	if (!Task_CollectVppBatch(candidate_vpp_mv, candidate_signature, &averaged_vpp_mv)) {
+		// 同一次按键继续补采，集满后才更新屏幕。
+		g_ols_debug.display_mv = g_screen_data.Vpp_val;
+		g_wave_refresh_pending = 1U;
+		ADC_Measure_ReleaseFrame();
+		return;
+	}
+	g_working_screen_data.Vpp_val = averaged_vpp_mv;
+	g_ols_debug.display_mv = averaged_vpp_mv;
 
 	// 频谱柱只表达已确认的分量。
 	Task_UpdateSpectrumBars(&g_working_screen_data, h_count);
