@@ -36,7 +36,8 @@ static const float32_t TASK_BASE_MIN_AMP_V = 0.003f;
 static const float32_t TASK_FREQ_GRID_HZ = 500.0f;
 static const float32_t TASK_BASE_MIN_FREQ_HZ = 10000.0f;
 static const float32_t TASK_BASE_MAX_FREQ_HZ = 250000.0f;
-static const float32_t TASK_VPP_HIGH_FREQ_SWITCH_HZ = 200000.0f;
+static const float32_t TASK_VPP_LOW_FREQ_BOUNDARY_HZ = 50000.0f;
+static const float32_t TASK_VPP_THREE_COMPONENT_HIGH_HZ = 120000.0f;
 static const float32_t TASK_COMPONENT_MAX_FREQ_HZ = 500000.0f;
 static const float32_t TASK_FREQ_EDGE_TOLERANCE_HZ = 250.0f;
 static const float32_t TASK_HARMONIC_FREQ_TOLERANCE_HZ = TASK_FREQ_GRID_HZ;
@@ -457,9 +458,21 @@ void Task_Signal_Processing(void)
 	g_vpp_debug.cycle_trim20_mv = cycle_set.trim20_v * 1000.0f;
 	g_vpp_debug.cycle_trim30_mv = cycle_set.trim30_v * 1000.0f;
 	g_vpp_debug.cycle_auto_mv = cycle_set.auto_v * 1000.0f;
-	g_working_screen_data.Vpp_val = (f1 < TASK_VPP_HIGH_FREQ_SWITCH_HZ)
-	                                ? g_vpp_debug.rank101_mv
-	                                : g_vpp_debug.rank3_mv;
+	// 保底值按有效分量数和频段选取；这些分界来自现场实测数据。
+	if (h_count <= 1U) {
+		// 纯正弦的 Vpp 只由基波峰值决定，不需要相位。
+		g_working_screen_data.Vpp_val = 2.0f * g_working_screen_data.harmonic_amp[0];
+	} else if (h_count == 2U) {
+		g_working_screen_data.Vpp_val = (f1 < TASK_VPP_LOW_FREQ_BOUNDARY_HZ)
+		                                ? g_vpp_debug.rank141_mv
+		                                : g_vpp_debug.rank3_mv;
+	} else if (f1 < TASK_VPP_LOW_FREQ_BOUNDARY_HZ) {
+		g_working_screen_data.Vpp_val = g_vpp_debug.rank101_mv;
+	} else if (f1 < TASK_VPP_THREE_COMPONENT_HIGH_HZ) {
+		g_working_screen_data.Vpp_val = g_vpp_debug.avg81_160_mv;
+	} else {
+		g_working_screen_data.Vpp_val = g_vpp_debug.cycle_auto_mv;
+	}
 	g_vpp_debug.model_mv = 0.0f;
 	for (uint8_t component = 0U; component < 4U; component++) {
 		g_rel_phase_deg[component] = 0.0f;
@@ -529,18 +542,23 @@ void SerialScreen_Render_Task(const SerialScreenData_t *data)
 		return;
 	}
 
-	// page0：n1=Vpp(mV)，n2=Vrms(mV)，n3=f1(Hz)；控件只收整数。
+	// page0：Vpp、Vrms 保留 1 位小数并带单位，基频显示整数。
 	char command[40];
-	snprintf(command, sizeof(command), "n1.val=%lu",
-	         (unsigned long)(data->Vpp_val + 0.5f));
+	uint32_t vpp_tenth_mv = (uint32_t)(data->Vpp_val * 10.0f + 0.5f);
+	uint32_t vrms_tenth_mv = (uint32_t)(data->Vrms_val * 10.0f + 0.5f);
+	uint32_t base_freq_hz = (uint32_t)(data->f1_base_freq + 0.5f);
+	snprintf(command, sizeof(command), "t_vpp.txt=\"%lu.%lu mV\"",
+	         (unsigned long)(vpp_tenth_mv / 10U),
+	         (unsigned long)(vpp_tenth_mv % 10U));
 	HMISendString(command);
 
-	snprintf(command, sizeof(command), "n2.val=%lu",
-	         (unsigned long)(data->Vrms_val + 0.5f));
+	snprintf(command, sizeof(command), "t_vrms.txt=\"%lu.%lu mV\"",
+	         (unsigned long)(vrms_tenth_mv / 10U),
+	         (unsigned long)(vrms_tenth_mv % 10U));
 	HMISendString(command);
 
-	snprintf(command, sizeof(command), "n3.val=%lu",
-	         (unsigned long)(data->f1_base_freq + 0.5f));
+	snprintf(command, sizeof(command), "t_f.txt=\"%lu Hz\"",
+	         (unsigned long)base_freq_hz);
 	HMISendString(command);
 
 	(void)HMI_SendWaveform(data->wave_pixels, HMI_WAVE_SOURCE_POINTS);
@@ -677,21 +695,24 @@ static HAL_StatusTypeDef HMI_SendSpectrum(const SerialScreenData_t *data)
 	char command[40];
 	float32_t max_amp = 0.0f;
 
-	// page1：n0~n2 为峰值(mV)，n3~n5 为频率(Hz)。
+	// page1：幅值保留 1 位小数，频率显示整数；单位由界面固定显示。
 	for (uint8_t i = 0U; i < 3U; i++) {
 		float32_t amp_mv = (i < data->harmonic_count) ? data->harmonic_amp[i] : 0.0f;
 		float32_t freq_hz = (i < data->harmonic_count)
 		                  ? data->harmonic_freq[i] * 1000.0f
 		                  : 0.0f;
+		uint32_t amp_tenth_mv = (uint32_t)(amp_mv * 10.0f + 0.5f);
+		uint32_t freq_hz_int = (uint32_t)(freq_hz + 0.5f);
 
-		snprintf(command, sizeof(command), "n%u.val=%lu",
-		         (unsigned int)i,
-		         (unsigned long)(amp_mv + 0.5f));
+		snprintf(command, sizeof(command), "t_vp%u.txt=\"%lu.%lu\"",
+		         (unsigned int)(i + 1U),
+		         (unsigned long)(amp_tenth_mv / 10U),
+		         (unsigned long)(amp_tenth_mv % 10U));
 		HMISendString(command);
 
-		snprintf(command, sizeof(command), "n%u.val=%lu",
-		         (unsigned int)(i + 3U),
-		         (unsigned long)(freq_hz + 0.5f));
+		snprintf(command, sizeof(command), "t_f%u.txt=\"%lu\"",
+		         (unsigned int)(i + 1U),
+		         (unsigned long)freq_hz_int);
 		HMISendString(command);
 
 		if (amp_mv > max_amp) {
