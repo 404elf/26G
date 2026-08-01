@@ -25,10 +25,9 @@
 // 显示帧放 IRAM1，避开 DMA 与 FFT 热区。
 SerialScreenData_t g_screen_data __attribute__((section(".iram1")));
 
-// 暂不参与正式显示，用来核对重构 Vpp 与相位重复性。
-volatile float g_vpp_raw_debug_mv = 0.0f;
-volatile float g_vpp_model_debug_mv = 0.0f;
-volatile float g_relative_phase_debug_deg[4] = { 0.0f };
+// 保留全部候选供监视窗口比较，正式显示按频段选取。
+volatile TaskVppDebug_t g_vpp_debug = { 0 };
+volatile float g_rel_phase_deg[4] = { 0.0f };
 
 // 测量边界与抗噪门限，单位见变量名。
 static const uint32_t TASK_SAMPLE_TIMEOUT_MS = 10U;
@@ -37,6 +36,7 @@ static const float32_t TASK_BASE_MIN_AMP_V = 0.003f;
 static const float32_t TASK_FREQ_GRID_HZ = 500.0f;
 static const float32_t TASK_BASE_MIN_FREQ_HZ = 10000.0f;
 static const float32_t TASK_BASE_MAX_FREQ_HZ = 250000.0f;
+static const float32_t TASK_VPP_HIGH_FREQ_SWITCH_HZ = 200000.0f;
 static const float32_t TASK_COMPONENT_MAX_FREQ_HZ = 500000.0f;
 static const float32_t TASK_FREQ_EDGE_TOLERANCE_HZ = 250.0f;
 static const float32_t TASK_HARMONIC_FREQ_TOLERANCE_HZ = TASK_FREQ_GRID_HZ;
@@ -403,14 +403,66 @@ void Task_Signal_Processing(void)
 		}
 	}
 
-	// 正式结果仍用原始 DMA 极值；模型 Vpp 只进入调试变量。
+	// 同一帧保留多种 Vpp，正式值在末尾按基频选择。
 	g_working_screen_data.harmonic_count = h_count;
 	g_working_screen_data.Vrms_val = SIG_Calculate_TrueRMS(g_working_screen_data.harmonic_amp, h_count);
-	g_working_screen_data.Vpp_val = SIG_Calculate_Vpp(adc_dma_buf, gain_snapshot) * 1000.0f;
-	g_vpp_raw_debug_mv = g_working_screen_data.Vpp_val;
-	g_vpp_model_debug_mv = 0.0f;
+	SIG_VppSet_t vpp_set;
+	if (!SIG_Calculate_VppSet(adc_dma_buf, gain_snapshot, &vpp_set)) {
+		ADC_Measure_ReleaseFrame();
+		return;
+	}
+	g_vpp_debug.rank1_mv = vpp_set.rank1_v * 1000.0f;
+	g_vpp_debug.rank3_mv = vpp_set.rank3_v * 1000.0f;
+	g_vpp_debug.rank5_mv = vpp_set.rank5_v * 1000.0f;
+	g_vpp_debug.rank7_mv = vpp_set.rank7_v * 1000.0f;
+	g_vpp_debug.rank9_mv = vpp_set.rank9_v * 1000.0f;
+	g_vpp_debug.rank13_mv = vpp_set.rank13_v * 1000.0f;
+	g_vpp_debug.rank17_mv = vpp_set.rank17_v * 1000.0f;
+	g_vpp_debug.rank21_mv = vpp_set.rank21_v * 1000.0f;
+	g_vpp_debug.rank25_mv = vpp_set.rank25_v * 1000.0f;
+	g_vpp_debug.rank31_mv = vpp_set.rank31_v * 1000.0f;
+	g_vpp_debug.rank35_mv = vpp_set.rank35_v * 1000.0f;
+	g_vpp_debug.rank41_mv = vpp_set.rank41_v * 1000.0f;
+	g_vpp_debug.rank45_mv = vpp_set.rank45_v * 1000.0f;
+	g_vpp_debug.rank51_mv = vpp_set.rank51_v * 1000.0f;
+	g_vpp_debug.rank61_mv = vpp_set.rank61_v * 1000.0f;
+	g_vpp_debug.rank81_mv = vpp_set.rank81_v * 1000.0f;
+	g_vpp_debug.rank101_mv = vpp_set.rank101_v * 1000.0f;
+	g_vpp_debug.rank121_mv = vpp_set.rank121_v * 1000.0f;
+	g_vpp_debug.rank141_mv = vpp_set.rank141_v * 1000.0f;
+	g_vpp_debug.rank161_mv = vpp_set.rank161_v * 1000.0f;
+	g_vpp_debug.rank181_mv = vpp_set.rank181_v * 1000.0f;
+	g_vpp_debug.rank200_mv = vpp_set.rank200_v * 1000.0f;
+	g_vpp_debug.avg3_8_mv = vpp_set.avg3_8_v * 1000.0f;
+	g_vpp_debug.avg5_12_mv = vpp_set.avg5_12_v * 1000.0f;
+	g_vpp_debug.avg9_24_mv = vpp_set.avg9_24_v * 1000.0f;
+	g_vpp_debug.avg17_32_mv = vpp_set.avg17_32_v * 1000.0f;
+	g_vpp_debug.avg25_48_mv = vpp_set.avg25_48_v * 1000.0f;
+	g_vpp_debug.avg33_64_mv = vpp_set.avg33_64_v * 1000.0f;
+	g_vpp_debug.avg41_80_mv = vpp_set.avg41_80_v * 1000.0f;
+	g_vpp_debug.avg61_120_mv = vpp_set.avg61_120_v * 1000.0f;
+	g_vpp_debug.avg81_160_mv = vpp_set.avg81_160_v * 1000.0f;
+
+	SIG_CycleVppSet_t cycle_set = { 0 };
+	(void)SIG_Calculate_CycleVppSet(rfft_time_domain,
+	                                FFT_LENGTH,
+	                                FFT_SAMPLE_RATE_HZ,
+	                                f1_measured,
+	                                gain_snapshot,
+	                                &cycle_set);
+	g_vpp_debug.cycle_count = cycle_set.cycle_count;
+	g_vpp_debug.cycle_mean_mv = cycle_set.mean_v * 1000.0f;
+	g_vpp_debug.cycle_median_mv = cycle_set.median_v * 1000.0f;
+	g_vpp_debug.cycle_trim10_mv = cycle_set.trim10_v * 1000.0f;
+	g_vpp_debug.cycle_trim20_mv = cycle_set.trim20_v * 1000.0f;
+	g_vpp_debug.cycle_trim30_mv = cycle_set.trim30_v * 1000.0f;
+	g_vpp_debug.cycle_auto_mv = cycle_set.auto_v * 1000.0f;
+	g_working_screen_data.Vpp_val = (f1 < TASK_VPP_HIGH_FREQ_SWITCH_HZ)
+	                                ? g_vpp_debug.rank101_mv
+	                                : g_vpp_debug.rank3_mv;
+	g_vpp_debug.model_mv = 0.0f;
 	for (uint8_t component = 0U; component < 4U; component++) {
-		g_relative_phase_debug_deg[component] = 0.0f;
+		g_rel_phase_deg[component] = 0.0f;
 	}
 
 	// 相位投影用实测 f1 的整数倍；吸附频率只负责对外显示。
@@ -440,9 +492,9 @@ void Task_Signal_Processing(void)
 		ADC_Measure_ReleaseFrame();
 		return;
 	}
-	g_vpp_model_debug_mv = model_vpp_mv;
+	g_vpp_debug.model_mv = model_vpp_mv;
 	for (uint8_t component = 0U; component < h_count; component++) {
-		g_relative_phase_debug_deg[component] =
+		g_rel_phase_deg[component] =
 		    relative_phase_rad[component] * 57.29577951308232f;
 	}
 

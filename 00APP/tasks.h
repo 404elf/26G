@@ -25,10 +25,51 @@ typedef struct {
 // 只发布完整帧；显示层直接读取。
 extern SerialScreenData_t g_screen_data;
 
-// 对比阶段只供监视窗口读取，不参与当前屏幕结果。
-extern volatile float g_vpp_raw_debug_mv;
-extern volatile float g_vpp_model_debug_mv;
-extern volatile float g_relative_phase_debug_deg[4];
+// 同一帧的 Vpp 对比值，全部使用 mV；展开该结构即可截图。
+typedef struct {
+	float rank1_mv;
+	float rank3_mv;
+	float rank5_mv;
+	float rank7_mv;
+	float rank9_mv;
+	float rank13_mv;
+	float rank17_mv;
+	float rank21_mv;
+	float rank25_mv;
+	float rank31_mv;
+	float rank35_mv;
+	float rank41_mv;
+	float rank45_mv;
+	float rank51_mv;
+	float rank61_mv;
+	float rank81_mv;
+	float rank101_mv;
+	float rank121_mv;
+	float rank141_mv;
+	float rank161_mv;
+	float rank181_mv;
+	float rank200_mv;
+	float avg3_8_mv;
+	float avg5_12_mv;
+	float avg9_24_mv;
+	float avg17_32_mv;
+	float avg25_48_mv;
+	float avg33_64_mv;
+	float avg41_80_mv;
+	float avg61_120_mv;
+	float avg81_160_mv;
+	uint16_t cycle_count;
+	float cycle_mean_mv;
+	float cycle_median_mv;
+	float cycle_trim10_mv;
+	float cycle_trim20_mv;
+	float cycle_trim30_mv;
+	float cycle_auto_mv;
+	float model_mv;
+} TaskVppDebug_t;
+
+extern volatile TaskVppDebug_t g_vpp_debug;
+extern volatile float g_rel_phase_deg[4];
 
 // 完成一次采样、频谱分析和显示数据更新。
 void Task_Signal_Processing(void);
