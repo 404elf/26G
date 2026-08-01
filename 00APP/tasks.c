@@ -45,7 +45,7 @@ static const float32_t TASK_INTERFERENCE_CENTER_HZ = 1000000.0f;
 static const float32_t TASK_INTERFERENCE_SEARCH_HALF_HZ = 10000.0f;
 static const float32_t TASK_INTERFERENCE_MIN_AMP_V = 0.001f;
 
-#define TASK_VPP_BATCH_FRAMES 5U
+#define TASK_VPP_BATCH_FRAMES 3U
 #define TASK_DECISION_CONFIRM_FRAMES 3U
 #define TASK_DECISION_MAX_AUTO_RETRIES 8U
 #define TASK_DECISION_OLS_BIT (1UL << 4)
@@ -81,7 +81,7 @@ static uint8_t g_stable_decision_valid = 0U;
 static uint8_t g_pending_decision_count = 0U;
 static volatile uint8_t g_decision_retry_count = 0U;
 
-// 每次按键单独收集 5 帧；发布后不把本轮结果带到下一次按键。
+// 每次按键单独收集 3 帧；发布后不把本轮结果带到下一次按键。
 static float32_t g_vpp_batch_mv[TASK_VPP_BATCH_FRAMES] = { 0.0f };
 static uint32_t g_vpp_batch_signature = 0U;
 static uint8_t g_vpp_batch_count = 0U;
@@ -284,7 +284,7 @@ static uint8_t Task_CollectVppBatch(float32_t candidate_mv,
 		sorted[j] = value;
 	}
 
-	*average_mv = (sorted[1] + sorted[2] + sorted[3]) / 3.0f;
+	*average_mv = sorted[1];
 	return 1U;
 }
 
