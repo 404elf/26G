@@ -19,6 +19,8 @@
 #define HMI_SPECTRUM_TX_POINTS 496U
 #define HMI_SPECTRUM_SIDE_MARGIN 16U
 #define HMI_ADD_READY_TIMEOUT_MS 100U
+#define HMI_UART_TX_TIMEOUT_MS 100U
+#define HMI_COMMAND_MAX_LENGTH 48U
 #define HMI_VIEW_WAVEFORM 0U
 #define HMI_VIEW_SPECTRUM 1U
 
@@ -471,18 +473,26 @@ void Task_Signal_Processing(void)
 	// 调试刷新不改周期模式。
 	g_wave_refresh_pending = 1U;
 #endif
-	if (g_wave_refresh_pending == 0U) {
-		return;
-	}
-
+	// 请求来自 UART 中断；快照与清标志必须原子完成，避免丢失临界时刻的新按键。
+	uint32_t irq_state = __get_PRIMASK();
+	__disable_irq();
+	uint8_t refresh_pending = g_wave_refresh_pending;
 	uint8_t requested_wave_mode = (g_requested_wave_mode == 3U) ? 3U : 1U;
 	uint8_t requested_view = (g_requested_view == HMI_VIEW_SPECTRUM)
 	                       ? HMI_VIEW_SPECTRUM
 	                       : HMI_VIEW_WAVEFORM;
-	g_wave_refresh_pending = 0U;
-	if (g_vpp_batch_reset_pending != 0U) {
-		Task_ResetVppBatch();
+	uint8_t reset_vpp_batch = g_vpp_batch_reset_pending;
+	if (refresh_pending != 0U) {
+		g_wave_refresh_pending = 0U;
 		g_vpp_batch_reset_pending = 0U;
+	}
+	__set_PRIMASK(irq_state);
+
+	if (refresh_pending == 0U) {
+		return;
+	}
+	if (reset_vpp_batch != 0U) {
+		Task_ResetVppBatch();
 	}
 
 	// 采样
@@ -939,26 +949,45 @@ int fputc(int ch, FILE *f)
 
 // 陶晶驰串口屏
 
-static void UART_SendByte(uint8_t byte)
-{
-	HAL_UART_Transmit(&huart1, &byte, 1, 0xFFFF);
-}
-
-// HMI 指令以三个 0xFF 结尾。
+// HMI 指令和三个 0xFF 一次发送，减少逐字节 HAL 调用开销。
 static void HMISendString(const char *str)
 {
-	while (*str) {
-		UART_SendByte((uint8_t)*str++);
+	if (str == NULL) {
+		return;
 	}
-	UART_SendByte(0xFF);
-	UART_SendByte(0xFF);
-	UART_SendByte(0xFF);
+
+	size_t command_length = strlen(str);
+	if (command_length > HMI_COMMAND_MAX_LENGTH) {
+		return;
+	}
+
+	uint8_t frame[HMI_COMMAND_MAX_LENGTH + 3U];
+	memcpy(frame, str, command_length);
+	frame[command_length] = 0xFFU;
+	frame[command_length + 1U] = 0xFFU;
+	frame[command_length + 2U] = 0xFFU;
+	(void)HAL_UART_Transmit(&huart1,
+	                       frame,
+	                       (uint16_t)(command_length + 3U),
+	                       HMI_UART_TX_TIMEOUT_MS);
 }
 
 static HAL_StatusTypeDef HMI_SendWaveform(const uint16_t *wave_pixels, uint16_t source_count)
 {
 	if (wave_pixels == NULL || source_count < 2U) {
 		return HAL_ERROR;
+	}
+
+	// 当前源点和屏幕同为 800 点，直接转换与旧插值公式逐字节等价。
+	if (source_count == HMI_WAVE_TX_POINTS) {
+		for (uint16_t i = 0U; i < HMI_WAVE_TX_POINTS; i++) {
+			uint16_t pixel = wave_pixels[i];
+			if (pixel > 255U) {
+				pixel = 255U;
+			}
+			g_hmi_wave_tx[i] = (uint8_t)(255U - pixel);
+		}
+		return HMI_SendCurveBytes(HMI_WAVE_TX_POINTS);
 	}
 
 	// s0 宽 800 像素；源点变化时这里仍负责重采样到 800 点。

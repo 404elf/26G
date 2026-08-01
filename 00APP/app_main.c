@@ -1,11 +1,8 @@
 #include "app_main.h"
-#include "tasks.h"
 
-// 入口层只做调度，具体实现放在各功能模块。
-void ADC_Measure_Init(void);
-void Measure_ADC_HalfCpltCallback(void);
-void Measure_ADC_FullCpltCallback(void);
-void FFT_Init(void);
+#include "FFT.h"
+#include "adc_measure.h"
+#include "tasks.h"
 
 
 void app_init(void)
