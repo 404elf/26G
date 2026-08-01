@@ -132,6 +132,58 @@ int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg)
 	return -1;
 }
 
+#define SIG_MODEL_VPP_POINTS 4096U
+
+static float32_t SIG_CalculateModelVpp(const float32_t *component_freq_hz,
+                                       const float32_t *component_amp,
+                                       const float32_t *relative_phase,
+                                       uint8_t component_count)
+{
+    const float32_t two_pi = 6.28318530717958647692f;
+    float32_t osc_cos[4] = { 0.0f };
+    float32_t osc_sin[4] = { 0.0f };
+    float32_t step_cos[4] = { 0.0f };
+    float32_t step_sin[4] = { 0.0f };
+
+    for (uint8_t component = 0U; component < component_count; component++) {
+        uint32_t order = (uint32_t)(component_freq_hz[component] / component_freq_hz[0] + 0.5f);
+        if (order < 1U) {
+            return 0.0f;
+        }
+        float32_t step = two_pi * (float32_t)order / (float32_t)SIG_MODEL_VPP_POINTS;
+        osc_cos[component] = arm_cos_f32(relative_phase[component]);
+        osc_sin[component] = arm_sin_f32(relative_phase[component]);
+        step_cos[component] = arm_cos_f32(step);
+        step_sin[component] = arm_sin_f32(step);
+    }
+
+    float32_t model_min = 0.0f;
+    float32_t model_max = 0.0f;
+    for (uint16_t sample = 0U; sample < SIG_MODEL_VPP_POINTS; sample++) {
+        float32_t value = 0.0f;
+        for (uint8_t component = 0U; component < component_count; component++) {
+            value += component_amp[component] * osc_cos[component];
+        }
+
+        if (sample == 0U) {
+            model_min = value;
+            model_max = value;
+        } else {
+            if (value < model_min) { model_min = value; }
+            if (value > model_max) { model_max = value; }
+        }
+
+        for (uint8_t component = 0U; component < component_count; component++) {
+            float32_t next_cos = osc_cos[component] * step_cos[component] -
+                                 osc_sin[component] * step_sin[component];
+            osc_sin[component] = osc_sin[component] * step_cos[component] +
+                                 osc_cos[component] * step_sin[component];
+            osc_cos[component] = next_cos;
+        }
+    }
+
+    return model_max - model_min;
+}
 uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
                                     uint16_t sample_count,
                                     float sample_rate_hz,
@@ -140,11 +192,22 @@ uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
                                     uint8_t component_count,
                                     uint8_t period_count,
                                     uint16_t *out_pixels,
-                                    uint16_t out_len)
+                                    uint16_t out_len,
+                                    float *out_model_vpp,
+                                    float *out_relative_phase)
 {
     const float32_t two_pi = 6.28318530717958647692f;
     float32_t raw_phase[4] = { 0.0f };
     float32_t relative_phase[4] = { 0.0f };
+
+    if (out_model_vpp != NULL) {
+        *out_model_vpp = 0.0f;
+    }
+    if (out_relative_phase != NULL) {
+        for (uint8_t component = 0U; component < 4U; component++) {
+            out_relative_phase[component] = 0.0f;
+        }
+    }
 
     if (time_domain == NULL || component_freq_hz == NULL || component_amp == NULL ||
         out_pixels == NULL || sample_count < 2U || out_len == 0U ||
@@ -199,6 +262,18 @@ uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
         while (phase > 3.14159265358979323846f) { phase -= two_pi; }
         while (phase < -3.14159265358979323846f) { phase += two_pi; }
         relative_phase[component] = phase;
+    }
+
+    if (out_relative_phase != NULL) {
+        for (uint8_t component = 0U; component < component_count; component++) {
+            out_relative_phase[component] = relative_phase[component];
+        }
+    }
+    if (out_model_vpp != NULL) {
+        *out_model_vpp = SIG_CalculateModelVpp(component_freq_hz,
+                                               component_amp,
+                                               relative_phase,
+                                               component_count);
     }
 
     uint8_t periods = (period_count == 3U) ? 3U : 1U;

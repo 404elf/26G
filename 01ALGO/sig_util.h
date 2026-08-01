@@ -11,7 +11,7 @@ float SIG_Calculate_TrueRMS(const float *harmonic_amps, uint8_t count);
 float SIG_Calculate_Vpp(const uint32_t *dma_buf, float linear_gain);
 // 查找带迟滞的上升过零点。
 int SIG_Find_Hysteresis_ZeroCrossing(const float *unpacked_v, float V_avg);
-// 从原始帧估相位，再按谐波参数合成 1 或 3 个周期。
+// 从原始帧估相位并合成波形；模型 Vpp 与 component_amp 使用相同单位。
 uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
                                     uint16_t sample_count,
                                     float sample_rate_hz,
@@ -20,6 +20,8 @@ uint8_t SIG_ReconstructHarmonicWave(const float *time_domain,
                                     uint8_t component_count,
                                     uint8_t period_count,
                                     uint16_t *out_pixels,
-                                    uint16_t out_len);
+                                    uint16_t out_len,
+                                    float *out_model_vpp,
+                                    float *out_relative_phase);
 
 #endif /* __SIG_UTIL_H */

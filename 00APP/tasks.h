@@ -25,6 +25,11 @@ typedef struct {
 // 只发布完整帧；显示层直接读取。
 extern SerialScreenData_t g_screen_data;
 
+// 对比阶段只供监视窗口读取，不参与当前屏幕结果。
+extern volatile float g_vpp_raw_debug_mv;
+extern volatile float g_vpp_model_debug_mv;
+extern volatile float g_relative_phase_debug_deg[4];
+
 // 完成一次采样、频谱分析和显示数据更新。
 void Task_Signal_Processing(void);
 // 请求刷新 1 或 3 个周期；中断里只发请求，不直接跑 ADC/FFT。

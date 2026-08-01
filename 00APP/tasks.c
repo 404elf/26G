@@ -25,6 +25,11 @@
 // 显示帧放 IRAM1，避开 DMA 与 FFT 热区。
 SerialScreenData_t g_screen_data __attribute__((section(".iram1")));
 
+// 暂不参与正式显示，用来核对重构 Vpp 与相位重复性。
+volatile float g_vpp_raw_debug_mv = 0.0f;
+volatile float g_vpp_model_debug_mv = 0.0f;
+volatile float g_relative_phase_debug_deg[4] = { 0.0f };
+
 // 测量边界与抗噪门限，单位见变量名。
 static const uint32_t TASK_SAMPLE_TIMEOUT_MS = 10U;
 static const float32_t TASK_HARMONIC_NOISE_FLOOR_V = 0.002f;
@@ -398,27 +403,47 @@ void Task_Signal_Processing(void)
 		}
 	}
 
-	// 指标：RMS 由分量合成，Vpp 从原始 DMA 极值统计。
+	// 正式结果仍用原始 DMA 极值；模型 Vpp 只进入调试变量。
 	g_working_screen_data.harmonic_count = h_count;
 	g_working_screen_data.Vrms_val = SIG_Calculate_TrueRMS(g_working_screen_data.harmonic_amp, h_count);
 	g_working_screen_data.Vpp_val = SIG_Calculate_Vpp(adc_dma_buf, gain_snapshot) * 1000.0f;
-
-	// 用实测幅值和相对相位合成干净的显示波形。
-	float32_t component_freq_hz[4] = { 0.0f };
-	for (uint8_t component = 0U; component < h_count; component++) {
-		component_freq_hz[component] = g_working_screen_data.harmonic_freq[component] * 1000.0f;
+	g_vpp_raw_debug_mv = g_working_screen_data.Vpp_val;
+	g_vpp_model_debug_mv = 0.0f;
+	for (uint8_t component = 0U; component < 4U; component++) {
+		g_relative_phase_debug_deg[component] = 0.0f;
 	}
+
+	// 相位投影用实测 f1 的整数倍；吸附频率只负责对外显示。
+	float32_t phase_freq_hz[4] = { 0.0f };
+	float32_t relative_phase_rad[4] = { 0.0f };
+	for (uint8_t component = 0U; component < h_count; component++) {
+		float32_t display_freq_hz = g_working_screen_data.harmonic_freq[component] * 1000.0f;
+		uint32_t order = (uint32_t)(display_freq_hz / f1 + 0.5f);
+		if (order < 1U) {
+			order = 1U;
+		}
+		phase_freq_hz[component] = f1_measured * (float32_t)order;
+	}
+
+	float32_t model_vpp_mv = 0.0f;
 	if (!SIG_ReconstructHarmonicWave(rfft_time_domain,
 	                                 FFT_LENGTH,
 	                                 FFT_SAMPLE_RATE_HZ,
-	                                 component_freq_hz,
+	                                 phase_freq_hz,
 	                                 g_working_screen_data.harmonic_amp,
 	                                 h_count,
 	                                 requested_wave_mode,
 	                                 g_working_screen_data.wave_pixels,
-	                                 HMI_WAVE_SOURCE_POINTS)) {
+	                                 HMI_WAVE_SOURCE_POINTS,
+	                                 &model_vpp_mv,
+	                                 relative_phase_rad)) {
 		ADC_Measure_ReleaseFrame();
 		return;
+	}
+	g_vpp_model_debug_mv = model_vpp_mv;
+	for (uint8_t component = 0U; component < h_count; component++) {
+		g_relative_phase_debug_deg[component] =
+		    relative_phase_rad[component] * 57.29577951308232f;
 	}
 
 	// 频谱柱只表达已确认的分量。
